@@ -14,7 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Kairyuu Estoque",
-  description: "Gestão de estoque, eventos, clientes e encomendas da Kairyuu",
+  description:
+    "Gestão interna de estoque, eventos, clientes e envios — terceira geração do controle da Kairyuu",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

@@ -1,19 +1,32 @@
 # Kairyuu Estoque
 
-Sistema web de estoque, eventos (caixa física), clientes e encomendas da loja Kairyuu.
+Sistema web interno da [Kairyuu](https://github.com/paulomafraa) para estoque, eventos, clientes, encomendas e envios.
+
+> App de uso da staff (login obrigatório). Este repositório é público para portfólio — não expõe dados nem o detalhe operacional da loja.
+
+**Página do projeto:** abra a raiz do deploy (ou rode local e acesse `/`) sem estar logado.
+
+## Evolução
+
+| | Projeto | Foco |
+|---|---|---|
+| v1 | [ControleEstoque](https://github.com/paulomafraa/ControleEstoque) | Desktop C# / WinForms, dados locais |
+| v2 | [GerenciadorEstoque.v2](https://github.com/paulomafraa/GerenciadorEstoque.v2) | Blazor + API + MySQL no Google Cloud |
+| **v3** | **este repo** | Next.js + Supabase + Vercel, alinhado à operação real |
+
+Cada versão ampliou o escopo: do inventário local → multi-usuário na nuvem → produto completo para o dia a dia da loja.
 
 ## Stack
 
 - Next.js (App Router) + TypeScript + Tailwind
-- Supabase (Auth + Postgres + funções de movimento de estoque)
+- Supabase (Auth + Postgres)
+- Deploy: Vercel
 
-## Setup rápido
+## Setup
 
 1. Crie um projeto no [Supabase](https://supabase.com).
-2. No **SQL Editor**, cole e execute `supabase/schema.sql`.
-3. Em **Authentication → Providers**, deixe e-mail habilitado.
-4. Copie as chaves em **Project Settings → API**.
-5. Na pasta do projeto:
+2. No SQL Editor, execute `supabase/schema.sql` (e as migrations em `supabase/` se precisar).
+3. Copie as variáveis:
 
 ```bash
 cp .env.example .env.local
@@ -21,38 +34,20 @@ cp .env.example .env.local
 
 Preencha `NEXT_PUBLIC_SUPABASE_URL` e `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 
-6. Rode o app:
+4. Rode:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Abra [http://localhost:3000](http://localhost:3000), crie a conta da staff e comece pelo **Estoque**.
-
-## Fluxo operacional
-
-1. **Estoque** — cadastra carta (quais + quantas). Marque **encomendável** se dá para pedir sem ter no estoque.
-2. **Eventos** — abre evento com **responsável**. Aloque cartas do estoque geral para a **caixa física**.
-3. No fechamento — indique quem ficou com o quê; **confirme** só com certeza de envio/pagamento; **feche** o evento (sobras voltam ao estoque).
-4. **Clientes** — histórico com origem (evento / venda direta / encomenda) + venda direta.
-5. **Encomendas** — status Japão → Brasil → sede → enviado → entregue. Entra no estoque só na **sede**; envio baixa estoque e grava no cliente.
-
-## Várias pessoas na staff
-
-- Cada um com login próprio.
-- Um **responsável por evento** (evento X ≠ evento Y).
-- Quem não é responsável ainda consegue ver; a UI avisa para não fechar evento alheio.
-- Todo movimento importante passa por funções SQL (evita estoque negativo e inconsistência na caixa).
+Abra [http://localhost:3000](http://localhost:3000) — landing pública — e use **Entrar** para a área da staff.
 
 ## Deploy
 
-- Front: Vercel (aponta o repo e coloca as mesmas env vars).
-- Banco/auth: Supabase (já na nuvem).
+- Front: Vercel (mesmo repo + env vars).
+- Banco/auth: Supabase.
 
-## Próximos ajustes (quando quiser)
+## Licença / uso
 
-- Travar de verdade no banco: só o `owner_id` fecha/confirma o evento
-- Papéis admin vs staff
-- Importação em massa de cartas
-- Relatório de movimentos
+Código aberto para estudo e portfólio. Dados de produção e credenciais não entram neste repositório.

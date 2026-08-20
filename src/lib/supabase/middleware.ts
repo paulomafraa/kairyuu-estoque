@@ -40,7 +40,8 @@ export async function updateSession(request: NextRequest) {
 
   const isLogin = path === "/login";
   const isSetup = path === "/setup";
-  const isPublic = isLogin || isSetup;
+  const isHome = path === "/";
+  const isPublic = isLogin || isSetup || isHome;
 
   if (!user && !isPublic) {
     const redirect = request.nextUrl.clone();
@@ -48,7 +49,7 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(redirect);
   }
 
-  if (user && isLogin) {
+  if (user && (isLogin || isHome)) {
     const redirect = request.nextUrl.clone();
     redirect.pathname = "/estoque";
     return NextResponse.redirect(redirect);

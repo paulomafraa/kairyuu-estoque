@@ -98,9 +98,14 @@ export default function LoginPage() {
         {mode === "login" ? "Criar conta da staff" : "Já tenho conta"}
       </button>
 
-      <Link href="/setup" className="mt-6 text-sm text-zinc-500 underline">
-        Ver passos de configuração
-      </Link>
+      <div className="mt-6 flex flex-col gap-2 text-sm text-zinc-500">
+        <Link href="/" className="underline">
+          Sobre o projeto
+        </Link>
+        <Link href="/setup" className="underline">
+          Ver passos de configuração
+        </Link>
+      </div>
     </main>
   );
 }
