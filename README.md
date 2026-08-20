@@ -1,36 +1,58 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kairyuu Estoque
 
-## Getting Started
+Sistema web de estoque, eventos (caixa física), clientes e encomendas da loja Kairyuu.
 
-First, run the development server:
+## Stack
+
+- Next.js (App Router) + TypeScript + Tailwind
+- Supabase (Auth + Postgres + funções de movimento de estoque)
+
+## Setup rápido
+
+1. Crie um projeto no [Supabase](https://supabase.com).
+2. No **SQL Editor**, cole e execute `supabase/schema.sql`.
+3. Em **Authentication → Providers**, deixe e-mail habilitado.
+4. Copie as chaves em **Project Settings → API**.
+5. Na pasta do projeto:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Preencha `NEXT_PUBLIC_SUPABASE_URL` e `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+6. Rode o app:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm install
+npm run dev
+```
 
-## Learn More
+Abra [http://localhost:3000](http://localhost:3000), crie a conta da staff e comece pelo **Estoque**.
 
-To learn more about Next.js, take a look at the following resources:
+## Fluxo operacional
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. **Estoque** — cadastra carta (quais + quantas). Marque **encomendável** se dá para pedir sem ter no estoque.
+2. **Eventos** — abre evento com **responsável**. Aloque cartas do estoque geral para a **caixa física**.
+3. No fechamento — indique quem ficou com o quê; **confirme** só com certeza de envio/pagamento; **feche** o evento (sobras voltam ao estoque).
+4. **Clientes** — histórico com origem (evento / venda direta / encomenda) + venda direta.
+5. **Encomendas** — status Japão → Brasil → sede → enviado → entregue. Entra no estoque só na **sede**; envio baixa estoque e grava no cliente.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Várias pessoas na staff
 
-## Deploy on Vercel
+- Cada um com login próprio.
+- Um **responsável por evento** (evento X ≠ evento Y).
+- Quem não é responsável ainda consegue ver; a UI avisa para não fechar evento alheio.
+- Todo movimento importante passa por funções SQL (evita estoque negativo e inconsistência na caixa).
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Deploy
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Front: Vercel (aponta o repo e coloca as mesmas env vars).
+- Banco/auth: Supabase (já na nuvem).
+
+## Próximos ajustes (quando quiser)
+
+- Travar de verdade no banco: só o `owner_id` fecha/confirma o evento
+- Papéis admin vs staff
+- Importação em massa de cartas
+- Relatório de movimentos
