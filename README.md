@@ -50,4 +50,4 @@ Abra [http://localhost:3000](http://localhost:3000) — landing pública — e u
 
 ## Licença / uso
 
-Código aberto para estudo e portfólio. Dados de produção e credenciais não entram neste repositório.
+Código aberto para estudo e portfólio. Dados de produção não incluídos ou citados.
