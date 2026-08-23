@@ -7,6 +7,11 @@ import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/Badge";
 import { EmptyState } from "@/components/EmptyState";
 import { ConfirmButton } from "@/components/ConfirmButton";
+import {
+  CustomerShipmentsBoard,
+  eventBundleKey,
+  groupByEvent,
+} from "@/components/CustomerShipmentsBoard";
 import { createClient } from "@/lib/supabase/client";
 import { logStaffAction } from "@/lib/audit";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
@@ -34,6 +39,7 @@ import type {
   Customer,
   CustomerNote,
   CustomerPhoto,
+  CustomerShipment,
   Event,
   EventSaleLine,
   GarageAuditEvent,
@@ -117,6 +123,7 @@ export default function ClienteDetailPage() {
 
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [items, setItems] = useState<GarageItem[]>([]);
+  const [shipments, setShipments] = useState<CustomerShipment[]>([]);
   const [chargeLines, setChargeLines] = useState<ChargeLine[]>([]); // todas as linhas ativas (pago e em aberto)
   const [notes, setNotes] = useState<CustomerNote[]>([]);
   const [photos, setPhotos] = useState<CustomerPhoto[]>([]);
@@ -165,7 +172,7 @@ export default function ClienteDetailPage() {
       setMeName(profile?.name || auth.data.user?.email || "Staff");
     }
 
-    const [cu, gi, nt, ph, profiles, ev] = await Promise.all([
+    const [cu, gi, nt, ph, profiles, ev, sh] = await Promise.all([
       supabase.from("customers").select("*").eq("id", customerId).single(),
       supabase
         .from("customer_garage_items")
@@ -189,6 +196,11 @@ export default function ClienteDetailPage() {
         .eq("customer_id", customerId)
         .order("created_at", { ascending: false })
         .limit(200),
+      supabase
+        .from("customer_shipments")
+        .select("*")
+        .eq("customer_id", customerId)
+        .order("shipped_on", { ascending: false }),
     ]);
 
     if (cu.error) setError(cu.error.message);
@@ -262,6 +274,15 @@ export default function ClienteDetailPage() {
             : null,
         })),
       );
+    }
+
+    if (sh.error) {
+      if (!String(sh.error.message || "").includes("does not exist")) {
+        // migration ainda não rodada — quadro de envios fica vazio
+      }
+      setShipments([]);
+    } else {
+      setShipments((sh.data as CustomerShipment[]) || []);
     }
   }, [supabase, customerId]);
 
@@ -358,10 +379,13 @@ export default function ClienteDetailPage() {
     item: GarageItem,
     amount: number,
     kind: "send" | "deliver" | "unsend",
+    opts?: { shipmentId?: string | null; shippedOn?: string | null },
   ) {
     const n = Math.max(1, amount);
     setError(null);
     let next = { ...item };
+    let shipmentId = item.shipment_id ?? null;
+    let shippedOn = item.shipped_on ?? null;
     if (kind === "send") {
       if (item.qty_with_store < n) {
         setError("Quantidade na loja insuficiente.");
@@ -375,6 +399,11 @@ export default function ClienteDetailPage() {
       } else if (next.qty_with_store > 0) {
         next.status = "in_garage";
       }
+      if (opts?.shipmentId) shipmentId = opts.shipmentId;
+      if (opts?.shippedOn) shippedOn = opts.shippedOn;
+      else if (!shippedOn) {
+        shippedOn = new Date().toISOString().slice(0, 10);
+      }
     } else if (kind === "unsend") {
       if (item.qty_sent < n) {
         setError("Quantidade enviada insuficiente para desfazer.");
@@ -384,6 +413,8 @@ export default function ClienteDetailPage() {
       next.qty_with_store += n;
       if (next.qty_sent === 0 && next.qty_delivered === 0) {
         next.status = "in_garage";
+        shipmentId = null;
+        shippedOn = null;
       } else if (next.qty_with_store > 0) {
         next.status = "in_garage";
       } else if (next.qty_sent > 0) {
@@ -408,10 +439,16 @@ export default function ClienteDetailPage() {
         qty_sent: next.qty_sent,
         qty_delivered: next.qty_delivered,
         status: next.status,
+        shipment_id: shipmentId,
+        shipped_on: shippedOn,
       })
       .eq("id", item.id);
     if (err) {
-      setError(err.message);
+      setError(
+        err.message.includes("shipment_id") || err.message.includes("shipped_on")
+          ? "Rode a migration migration_customer_shipments.sql no Supabase."
+          : err.message,
+      );
       return;
     }
     const actionLabel =
@@ -443,6 +480,169 @@ export default function ClienteDetailPage() {
       delete copy[item.id];
       return copy;
     });
+    await load();
+  }
+
+  async function ensureShipment(shippedOn: string, label = "") {
+    const existing = shipments.find(
+      (s) => s.shipped_on === shippedOn && (s.label || "") === (label || ""),
+    );
+    if (existing) return existing;
+
+    const { data, error: err } = await supabase
+      .from("customer_shipments")
+      .insert({
+        customer_id: customerId,
+        shipped_on: shippedOn,
+        label: label || "",
+        notes: "",
+        created_by: meId,
+      })
+      .select("*")
+      .single();
+    if (err) {
+      setError(
+        err.message.includes("customer_shipments")
+          ? "Rode a migration migration_customer_shipments.sql no Supabase."
+          : err.message,
+      );
+      return null;
+    }
+    return data as CustomerShipment;
+  }
+
+  async function createShipment(shippedOn: string, label: string) {
+    setBusy(true);
+    setError(null);
+    const row = await ensureShipment(shippedOn, label);
+    setBusy(false);
+    if (!row) return;
+    setInfo(`Pacote criado · ${fmtDay(shippedOn)}${label ? ` · ${label}` : ""}`);
+    await load();
+  }
+
+  async function deleteShipment(shipmentId: string) {
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("customer_shipments")
+      .delete()
+      .eq("id", shipmentId);
+    setBusy(false);
+    if (err) {
+      setError(err.message);
+      return;
+    }
+    setInfo("Pacote removido.");
+    await load();
+  }
+
+  async function shipEventItems(
+    eventKey: string,
+    shipmentId: string,
+    shippedOn: string,
+  ) {
+    const targets = garage.filter(
+      (i) => eventBundleKey(i) === eventKey && i.qty_with_store > 0,
+    );
+    if (!targets.length) {
+      setError("Nenhum item desse evento na caixinha.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    for (const item of targets) {
+      const n = item.qty_with_store;
+      const nextSent = item.qty_sent + n;
+      const { error: err } = await supabase
+        .from("customer_garage_items")
+        .update({
+          qty_with_store: 0,
+          qty_sent: nextSent,
+          status:
+            item.qty_delivered === 0 ? "shipped" : item.status,
+          shipment_id: shipmentId,
+          shipped_on: shippedOn,
+        })
+        .eq("id", item.id);
+      if (err) {
+        setBusy(false);
+        setError(
+          err.message.includes("shipment")
+            ? "Rode a migration migration_customer_shipments.sql no Supabase."
+            : err.message,
+        );
+        return;
+      }
+      await logEvent(
+        "send",
+        `${item.title}: ${n} enviado(s) no pacote ${fmtDay(shippedOn)} · por ${meName}`,
+        item.id,
+      );
+    }
+    setBusy(false);
+    setInfo(
+      `Evento enviado · ${targets.length} item(ns) no pacote de ${fmtDay(shippedOn)}`,
+    );
+    setTab("enviados");
+    await load();
+  }
+
+  async function shipEventToShipment(eventKey: string, shipmentId: string) {
+    const ship = shipments.find((s) => s.id === shipmentId);
+    if (!ship) {
+      setError("Pacote não encontrado.");
+      return;
+    }
+    await shipEventItems(eventKey, shipmentId, ship.shipped_on);
+  }
+
+  async function shipEventAlone(eventKey: string, shippedOn: string) {
+    setBusy(true);
+    const ship = await ensureShipment(shippedOn, "");
+    setBusy(false);
+    if (!ship) return;
+    await shipEventItems(eventKey, ship.id, ship.shipped_on);
+  }
+
+  async function attachSentEventToShipment(
+    eventKey: string,
+    shipmentId: string,
+  ) {
+    const ship = shipments.find((s) => s.id === shipmentId);
+    if (!ship) {
+      setError("Pacote não encontrado.");
+      return;
+    }
+    const targets = sent.filter(
+      (i) =>
+        eventBundleKey(i) === eventKey && i.qty_sent > 0 && !i.shipment_id,
+    );
+    if (!targets.length) {
+      setError("Nada solto desse evento para anexar.");
+      return;
+    }
+    setBusy(true);
+    const { error: err } = await supabase
+      .from("customer_garage_items")
+      .update({
+        shipment_id: shipmentId,
+        shipped_on: ship.shipped_on,
+      })
+      .in(
+        "id",
+        targets.map((t) => t.id),
+      );
+    setBusy(false);
+    if (err) {
+      setError(err.message);
+      return;
+    }
+    await logEvent(
+      "attach_shipment",
+      `${targets.length} item(ns) anexados ao pacote ${fmtDay(ship.shipped_on)} · por ${meName}`,
+    );
+    setInfo(`Evento anexado ao pacote de ${fmtDay(ship.shipped_on)}`);
     await load();
   }
 
@@ -846,6 +1046,9 @@ export default function ClienteDetailPage() {
                 {item.event_name}
                 {item.event_date ? ` · ${fmtDay(item.event_date)}` : ""}
               </Badge>
+            ) : null}
+            {item.shipped_on ? (
+              <Badge tone="info">Envio {fmtDay(item.shipped_on)}</Badge>
             ) : null}
           </div>
           {item.notes ? (
@@ -1543,26 +1746,73 @@ export default function ClienteDetailPage() {
             hint="Associe produtos pagos que estão conosco, ou marque pago no evento para entrar aqui."
           />
         ) : (
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Produto</th>
-                  <th>Qtds</th>
-                  <th>Valor</th>
-                  <th>Ações</th>
-                </tr>
-              </thead>
-              <tbody>
-                {garage.map((item) =>
-                  renderItemRow(item, {
-                    showStore: true,
-                    showSent: true,
-                    actions: "garage",
-                  }),
-                )}
-              </tbody>
-            </table>
+          <div className="space-y-4">
+            {groupByEvent(garage).length > 0 ? (
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50/60 p-4">
+                <h3 className="text-sm font-semibold text-zinc-900">
+                  Enviar por evento
+                </h3>
+                <p className="mt-1 text-xs text-zinc-600">
+                  Quase sempre o envio leva tudo de um evento. Use o botão ou vá
+                  em Enviados para montar um pacote com vários eventos no mesmo
+                  dia.
+                </p>
+                <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {groupByEvent(garage).map((b) => (
+                    <li
+                      key={b.key}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2"
+                    >
+                      <div>
+                        <div className="text-sm font-medium">{b.label}</div>
+                        <div className="text-xs text-zinc-500">
+                          {b.items.length} item(ns) · {b.qtyStore} un.
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-primary px-2 py-1 text-xs"
+                        disabled={busy}
+                        onClick={() => {
+                          const day = new Date().toISOString().slice(0, 10);
+                          void shipEventAlone(b.key, day);
+                        }}
+                      >
+                        Enviar tudo do evento
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  type="button"
+                  className="btn-secondary mt-3 text-xs"
+                  onClick={() => setTab("enviados")}
+                >
+                  Abrir quadro de pacotes
+                </button>
+              </div>
+            ) : null}
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr>
+                    <th>Produto</th>
+                    <th>Qtds</th>
+                    <th>Valor</th>
+                    <th>Ações</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {garage.map((item) =>
+                    renderItemRow(item, {
+                      showStore: true,
+                      showSent: true,
+                      actions: "garage",
+                    }),
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         )
       ) : null}
@@ -1595,42 +1845,56 @@ export default function ClienteDetailPage() {
       ) : null}
 
       {tab === "enviados" ? (
-        sent.length === 0 ? (
-          <EmptyState
-            title="Nenhum envio"
-            hint="Quando marcar enviado na caixinha, o item aparece aqui. Use “Voltar pra loja” para desfazer."
+        <div className="space-y-6">
+          <CustomerShipmentsBoard
+            garageItems={garage}
+            sentItems={sent}
+            shipments={shipments}
+            busy={busy}
+            onCreateShipment={createShipment}
+            onShipEventToShipment={shipEventToShipment}
+            onAttachSentEventToShipment={attachSentEventToShipment}
+            onShipEventAlone={shipEventAlone}
+            onDeleteShipment={deleteShipment}
           />
-        ) : (
-          <>
-            <p className="mb-3 text-sm text-zinc-600">
-              Para desfazer um envio marcado por engano, use{" "}
-              <strong>Voltar pra loja (desfazer envio)</strong> — o item volta
-              pra caixinha sem cancelar.
-            </p>
-            <div className="table-wrap">
-              <table className="data">
-                <thead>
-                  <tr>
-                    <th>Produto</th>
-                    <th>Qtds</th>
-                    <th>Valor</th>
-                    <th>Ações</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sent.map((item) =>
-                    renderItemRow(item, {
-                      showStore: true,
-                      showSent: true,
-                      showDelivered: true,
-                      actions: "sent",
-                    }),
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )
+
+          {sent.length > 0 ? (
+            <>
+              <div>
+                <h3 className="text-sm font-semibold text-zinc-900">
+                  Itens enviados (detalhe)
+                </h3>
+                <p className="mb-3 mt-1 text-sm text-zinc-600">
+                  Para desfazer um envio marcado por engano, use{" "}
+                  <strong>Voltar pra loja (desfazer envio)</strong> — o item
+                  volta pra caixinha sem cancelar.
+                </p>
+              </div>
+              <div className="table-wrap">
+                <table className="data">
+                  <thead>
+                    <tr>
+                      <th>Produto</th>
+                      <th>Qtds</th>
+                      <th>Valor</th>
+                      <th>Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sent.map((item) =>
+                      renderItemRow(item, {
+                        showStore: true,
+                        showSent: true,
+                        showDelivered: true,
+                        actions: "sent",
+                      }),
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+        </div>
       ) : null}
 
       {tab === "entregues" ? (

@@ -50,6 +50,8 @@ export type GarageItem = {
   event_name: string;
   event_date: string | null;
   event_id?: string | null;
+  shipment_id?: string | null;
+  shipped_on?: string | null;
   unit_price: number | null;
   notes: string;
   created_at: string;
@@ -60,6 +62,16 @@ export type GarageItem = {
   cancel_reason: string;
   created_by_profile?: Pick<Profile, "id" | "name"> | null;
   cancelled_by_profile?: Pick<Profile, "id" | "name"> | null;
+};
+
+export type CustomerShipment = {
+  id: string;
+  customer_id: string;
+  shipped_on: string;
+  label: string;
+  notes: string;
+  created_at: string;
+  created_by: string | null;
 };
 
 export type CustomerNote = {

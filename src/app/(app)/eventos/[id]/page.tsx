@@ -43,6 +43,7 @@ import type {
   EventProductCost,
   EventProductStock,
   EventSaleLine,
+  GarageItem,
   Profile,
 } from "@/lib/types";
 
@@ -96,6 +97,7 @@ export default function EventoDetailPage() {
 
   const [event, setEvent] = useState<(Event & { profiles?: Profile | null }) | null>(null);
   const [lines, setLines] = useState<EventSaleLine[]>([]);
+  const [garageById, setGarageById] = useState<Record<string, GarageItem>>({});
   const [productStock, setProductStock] = useState<EventProductStock[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [allocations, setAllocations] = useState<EventAllocation[]>([]);
@@ -223,7 +225,30 @@ export default function EventoDetailPage() {
     }
 
     if (ln.error) setError(ln.error.message);
-    else setLines((ln.data as EventSaleLine[]) || []);
+    else {
+      const saleLines = (ln.data as EventSaleLine[]) || [];
+      setLines(saleLines);
+      const garageIds = [
+        ...new Set(
+          saleLines
+            .map((l) => l.garage_item_id)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      ];
+      if (garageIds.length) {
+        const { data: garageRows } = await supabase
+          .from("customer_garage_items")
+          .select("*")
+          .in("id", garageIds);
+        const map: Record<string, GarageItem> = {};
+        for (const g of (garageRows as GarageItem[]) || []) {
+          map[g.id] = g;
+        }
+        setGarageById(map);
+      } else {
+        setGarageById({});
+      }
+    }
 
     if (ps.error && !String(ps.error.message || "").includes("does not exist")) {
       setError(ps.error.message);
@@ -373,6 +398,56 @@ export default function EventoDetailPage() {
     () => activeMainLines.filter((l) => selectedLineIds[l.id]).length,
     [activeMainLines, selectedLineIds],
   );
+
+  const selectedActiveLines = useMemo(
+    () => activeMainLines.filter((l) => selectedLineIds[l.id]),
+    [activeMainLines, selectedLineIds],
+  );
+
+  function lineReadyForShip(line: EventSaleLine): boolean {
+    return Boolean(line.separated && line.charged && line.paid);
+  }
+
+  function lineGarageShippable(line: EventSaleLine): boolean {
+    if (!line.garage_item_id) return false;
+    const g = garageById[line.garage_item_id];
+    if (!g) return line.paid; // pago com caixinha; status ainda carregando
+    if (g.status === "cancelled") return false;
+    return Number(g.qty_with_store) > 0;
+  }
+
+  function lineAlreadyShipped(line: EventSaleLine): boolean {
+    if (!line.garage_item_id) return false;
+    const g = garageById[line.garage_item_id];
+    if (!g) return false;
+    return (
+      Number(g.qty_with_store) <= 0 &&
+      Number(g.qty_sent) > 0 &&
+      g.status !== "cancelled"
+    );
+  }
+
+  const canMarkShipped = useMemo(() => {
+    if (selectedActiveLines.length === 0) return false;
+    if (!selectedActiveLines.every(lineReadyForShip)) return false;
+    return selectedActiveLines.some(lineGarageShippable);
+  }, [selectedActiveLines, garageById]);
+
+  const shipBlockedHint = useMemo(() => {
+    if (selectedActiveLines.length === 0) {
+      return "Selecione itens separados, cobrados e pagos";
+    }
+    if (!selectedActiveLines.every(lineReadyForShip)) {
+      return "Só habilita quando todos os selecionados estiverem separados, cobrados e pagos";
+    }
+    if (selectedActiveLines.every(lineAlreadyShipped)) {
+      return "Seleção já marcada como enviada";
+    }
+    if (!selectedActiveLines.some(lineGarageShippable)) {
+      return "Itens ainda sem caixinha — marque pago de novo se precisar";
+    }
+    return "Marca a caixinha como enviada";
+  }, [selectedActiveLines, garageById]);
 
   const allActiveSelected =
     activeMainLines.length > 0 && selectedCount === activeMainLines.length;
@@ -931,6 +1006,130 @@ export default function EventoDetailPage() {
           },
       value ? "Pago (foi pra caixinha)" : "Pagamento desfeito",
     );
+  }
+
+  async function markShipped(ids: string[]) {
+    if (!ids.length) return;
+    setError(null);
+    const ready = ids
+      .map((id) => lines.find((l) => l.id === id))
+      .filter((l): l is EventSaleLine => Boolean(l))
+      .filter(
+        (l) =>
+          lineReadyForShip(l) &&
+          lineGarageShippable(l) &&
+          Boolean(l.garage_item_id),
+      );
+    if (!ready.length) {
+      setError(
+        "Nada para enviar — selecione itens separados, cobrados e pagos (ainda na caixinha).",
+      );
+      return;
+    }
+
+    const shippedOn = new Date().toISOString().slice(0, 10);
+    const shipmentByCustomer = new Map<string, string>();
+
+    async function shipmentForCustomer(customerId: string): Promise<string | null> {
+      const cached = shipmentByCustomer.get(customerId);
+      if (cached) return cached;
+      const { data: existing } = await supabase
+        .from("customer_shipments")
+        .select("id")
+        .eq("customer_id", customerId)
+        .eq("shipped_on", shippedOn)
+        .eq("label", "")
+        .limit(1)
+        .maybeSingle();
+      if (existing?.id) {
+        shipmentByCustomer.set(customerId, existing.id);
+        return existing.id;
+      }
+      const { data: created, error: cErr } = await supabase
+        .from("customer_shipments")
+        .insert({
+          customer_id: customerId,
+          shipped_on: shippedOn,
+          label: "",
+          notes: "",
+          created_by: meId,
+        })
+        .select("id")
+        .single();
+      if (cErr || !created) return null;
+      shipmentByCustomer.set(customerId, created.id);
+      return created.id as string;
+    }
+
+    let shipped = 0;
+    for (const line of ready) {
+      const garageId = line.garage_item_id!;
+      const g =
+        garageById[garageId] ||
+        (
+          await supabase
+            .from("customer_garage_items")
+            .select("*")
+            .eq("id", garageId)
+            .maybeSingle()
+        ).data;
+      if (!g || Number(g.qty_with_store) <= 0) continue;
+
+      const n = Number(g.qty_with_store);
+      const nextQtyStore = 0;
+      const nextQtySent = Number(g.qty_sent) + n;
+      let nextStatus = g.status;
+      if (nextQtyStore === 0 && Number(g.qty_delivered) === 0) {
+        nextStatus = "shipped";
+      } else if (nextQtyStore > 0) {
+        nextStatus = "in_garage";
+      }
+
+      const shipmentId = line.customer_id
+        ? await shipmentForCustomer(line.customer_id)
+        : null;
+
+      const patch: Record<string, unknown> = {
+        qty_with_store: nextQtyStore,
+        qty_sent: nextQtySent,
+        status: nextStatus,
+        shipped_on: shippedOn,
+      };
+      if (shipmentId) patch.shipment_id = shipmentId;
+
+      const { error: err } = await supabase
+        .from("customer_garage_items")
+        .update(patch)
+        .eq("id", garageId);
+      if (err) {
+        setError(
+          err.message.includes("shipment") || err.message.includes("shipped_on")
+            ? "Rode a migration migration_customer_shipments.sql no Supabase."
+            : err.message,
+        );
+        return;
+      }
+      shipped += 1;
+      await logStaffAction(supabase, {
+        action: "send",
+        detail: `${line.product_title}: ${n} enviado(s) pelo evento ${event?.name || eventId} · por ${meName}`,
+        created_by: meId,
+        entity_type: "customer_garage_items",
+        entity_id: garageId,
+        event_id: eventId,
+        customer_id: line.customer_id,
+      });
+    }
+
+    if (!shipped) {
+      setError("Nenhum item pôde ser marcado como enviado.");
+      return;
+    }
+    setInfo(
+      `Marcado como enviado · ${shipped} item(ns) · ${meName}. Pacote do dia na ficha → Enviados.`,
+    );
+    setSelectedLineIds({});
+    await load();
   }
 
   async function cancelLines(ids: string[]) {
@@ -2943,6 +3142,17 @@ export default function EventoDetailPage() {
                 </button>
                 <button
                   type="button"
+                  className="btn-primary"
+                  title={shipBlockedHint}
+                  disabled={!canMarkShipped}
+                  onClick={() =>
+                    void markShipped(selectedIdsFromParticipant())
+                  }
+                >
+                  Marcar como enviado
+                </button>
+                <button
+                  type="button"
                   className="btn-secondary"
                   disabled={selectedCount === 0}
                   onClick={() =>
@@ -3067,12 +3277,17 @@ export default function EventoDetailPage() {
                                 >
                                   {line.paid ? "Pago" : "Em aberto"}
                                 </Badge>
-                                {line.garage_item_id ? (
+                                {line.garage_item_id && !lineAlreadyShipped(line) ? (
                                   <Badge
                                     tone="good"
                                     title="Caixinha/garagem = item guardado do cliente (criado ao marcar pago). Diferente de Separado (preparação física no evento)."
                                   >
                                     Caixinha/garagem
+                                  </Badge>
+                                ) : null}
+                                {lineAlreadyShipped(line) ? (
+                                  <Badge tone="info" title="Já saiu da caixinha">
+                                    Enviado
                                   </Badge>
                                 ) : null}
                               </div>

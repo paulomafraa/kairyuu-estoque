@@ -9,6 +9,7 @@ const EVOLUTION = [
     summary:
       "Desktop local: produtos, entradas/saídas e leitura financeira básica em arquivos.",
     href: "https://github.com/paulomafraa/ControleEstoque",
+    current: false,
   },
   {
     version: "v2",
@@ -18,6 +19,7 @@ const EVOLUTION = [
     summary:
       "Web multi-usuário com API, banco na nuvem e deploy containerizado.",
     href: "https://github.com/paulomafraa/GerenciadorEstoque.v2",
+    current: false,
   },
   {
     version: "v3",
