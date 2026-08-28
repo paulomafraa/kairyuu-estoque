@@ -136,6 +136,11 @@ export default function EventoDetailPage() {
   const [showShelved, setShowShelved] = useState(false);
   const [showShelvedEvent, setShowShelvedEvent] = useState(false);
   const [openProductTitles, setOpenProductTitles] = useState<Record<string, boolean>>({});
+  const [addVoteSearch, setAddVoteSearch] = useState("");
+  const [addVoteQty, setAddVoteQty] = useState(1);
+  const [addVoteShowNewFor, setAddVoteShowNewFor] = useState<string | null>(null);
+  const [addVoteNewName, setAddVoteNewName] = useState("");
+  const [addVoteNewPhone, setAddVoteNewPhone] = useState("");
 
   /** Revisão ❓: atribuir dono sem mexer em itens já pagos/organizados. */
   const [reviewLineId, setReviewLineId] = useState<string | null>(null);
@@ -1228,6 +1233,128 @@ export default function EventoDetailPage() {
       .eq("id", lineId);
     if (err) setError(err.message);
     else await load();
+  }
+
+  function productSalePrice(
+    title: string,
+    siblingLines: EventSaleLine[],
+  ): number | null {
+    for (const l of siblingLines) {
+      const p = lineUnitPrice(l);
+      if (p != null) return p;
+    }
+    const fromTitle = parseMoneyFromOption(title);
+    if (fromTitle != null) return fromTitle;
+    const cost = productCosts.find((c) => c.product_title === title);
+    if (cost?.price_sale != null && Number.isFinite(Number(cost.price_sale))) {
+      return Number(cost.price_sale);
+    }
+    return null;
+  }
+
+  async function addCustomerToProduct(
+    productTitle: string,
+    customer: Pick<Customer, "id" | "name" | "phone" | "phone_digits">,
+    qty: number,
+  ) {
+    const n = Math.max(1, Math.floor(qty) || 1);
+    const existing = lines.find(
+      (l) =>
+        l.product_title === productTitle &&
+        l.customer_id === customer.id &&
+        !l.cancelled &&
+        !isShelvedSaleLine(l, event?.kind),
+    );
+    if (existing) {
+      const cur = Number(existing.qty) > 0 ? Number(existing.qty) : 1;
+      await updateLineQty(existing.id, cur + n);
+      setAddVoteSearch("");
+      setAddVoteQty(1);
+      setInfo("Cliente já estava nesta carta — quantidade somada.");
+      return;
+    }
+
+    const siblings = lines.filter(
+      (l) => l.product_title === productTitle && !l.cancelled,
+    );
+    const phone =
+      customer.phone_digits || normalizePhoneDigits(customer.phone || "");
+    setBusy(true);
+    setError(null);
+    const { data, error: err } = await supabase
+      .from("event_sale_lines")
+      .insert({
+        event_id: eventId,
+        customer_id: customer.id,
+        phone_digits: phone,
+        customer_name_snapshot: customer.name || phone,
+        product_title: productTitle,
+        valor_ou_opcao: "Eu quero",
+        unit_price: productSalePrice(productTitle, siblings),
+        qty: n,
+        import_status: "voto",
+        certainty: "certain",
+        arremate: false,
+        poll_id: siblings[0]?.poll_id || "",
+        notes: "Voto corrigido na mão — planilha não leu",
+        created_by: meId,
+      })
+      .select("id")
+      .single();
+    setBusy(false);
+    if (err) {
+      setError(err.message);
+      return;
+    }
+    await logStaffAction(supabase, {
+      action: "corrigir_voto",
+      detail: `Voto corrigido · ${productTitle} → ${customer.name || phone} ×${n} · ${meName}`,
+      created_by: meId,
+      entity_type: "event_sale_line",
+      entity_id: data?.id || "",
+      customer_id: customer.id,
+      event_id: eventId,
+    });
+    setAddVoteSearch("");
+    setAddVoteQty(1);
+    setAddVoteShowNewFor(null);
+    setAddVoteNewName("");
+    setAddVoteNewPhone("");
+    setInfo(`Cliente adicionado em ${productTitle}.`);
+    await load();
+  }
+
+  async function createCustomerAndAddToProduct(productTitle: string) {
+    const phone = normalizePhoneDigits(addVoteNewPhone);
+    const name = addVoteNewName.trim() || phone;
+    if (!phone || phone.length < 10) {
+      setError("Informe um telefone válido (10–15 dígitos).");
+      return;
+    }
+    const existing = phoneToCustomer.get(phone);
+    if (existing) {
+      await addCustomerToProduct(productTitle, existing, addVoteQty);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const { data, error: err } = await supabase
+      .from("customers")
+      .insert({
+        name,
+        phone,
+        phone_digits: phone,
+        source: "manual",
+        notes: "",
+      })
+      .select("id, name, phone, phone_digits")
+      .single();
+    setBusy(false);
+    if (err) {
+      setError(err.message);
+      return;
+    }
+    await addCustomerToProduct(productTitle, data as Customer, addVoteQty);
   }
 
   async function updateLinePrice(lineId: string, raw: string) {
@@ -2831,70 +2958,229 @@ export default function EventoDetailPage() {
                       {open ? (
                         <tr className="bg-zinc-50">
                           <td colSpan={6} className="!py-3">
-                            <ul className="space-y-2 px-2">
-                              {row.lines.map((line) => {
-                                const who =
-                                  line.customers?.name ||
-                                  line.customer_name_snapshot ||
-                                  line.phone_digits ||
-                                  "Sem cliente";
-                                const phone =
-                                  line.customers?.phone || line.phone_digits || "";
-                                return (
-                                  <li
-                                    key={line.id}
-                                    className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm"
-                                  >
-                                    <div className="min-w-0">
-                                      {line.customer_id ? (
-                                        <Link
-                                          href={`/clientes/${line.customer_id}`}
-                                          className="font-medium underline decoration-zinc-300 underline-offset-2"
+                            {(() => {
+                              const alreadyIds = new Set(
+                                row.lines
+                                  .map((l) => l.customer_id)
+                                  .filter((id): id is string => Boolean(id)),
+                              );
+                              const q = addVoteSearch.trim().toLowerCase();
+                              const eventCustomers = participants
+                                .map((p) => {
+                                  if (!p.customer_id) return null;
+                                  return (
+                                    customers.find((x) => x.id === p.customer_id) ||
+                                    null
+                                  );
+                                })
+                                .filter(Boolean) as Customer[];
+                              const pool = q ? customers : eventCustomers;
+                              const filtered = pool
+                                .filter((c) => {
+                                  if (alreadyIds.has(c.id)) return false;
+                                  if (!q) return true;
+                                  const hay =
+                                    `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
+                                  return hay.includes(q);
+                                })
+                                .slice(0, 30);
+                              return (
+                                <div className="space-y-3 px-2">
+                                  <ul className="space-y-2">
+                                    {row.lines.map((line) => {
+                                      const who =
+                                        line.customers?.name ||
+                                        line.customer_name_snapshot ||
+                                        line.phone_digits ||
+                                        "Sem cliente";
+                                      const phone =
+                                        line.customers?.phone ||
+                                        line.phone_digits ||
+                                        "";
+                                      return (
+                                        <li
+                                          key={line.id}
+                                          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm"
                                         >
-                                          {who}
-                                          {phone && who !== phone
-                                            ? ` (${phone})`
-                                            : ""}
-                                        </Link>
-                                      ) : (
-                                        <span className="font-medium">{who}</span>
-                                      )}
-                                      <div className="text-xs text-zinc-500">
-                                        {line.paid
-                                          ? "pago"
-                                          : line.charged
-                                            ? "cobrado"
-                                            : "em aberto"}
-                                      </div>
+                                          <div className="min-w-0">
+                                            {line.customer_id ? (
+                                              <Link
+                                                href={`/clientes/${line.customer_id}`}
+                                                className="font-medium underline decoration-zinc-300 underline-offset-2"
+                                              >
+                                                {who}
+                                                {phone && who !== phone
+                                                  ? ` (${phone})`
+                                                  : ""}
+                                              </Link>
+                                            ) : (
+                                              <span className="font-medium">
+                                                {who}
+                                              </span>
+                                            )}
+                                            <div className="text-xs text-zinc-500">
+                                              {line.paid
+                                                ? "pago"
+                                                : line.charged
+                                                  ? "cobrado"
+                                                  : "em aberto"}
+                                            </div>
+                                          </div>
+                                          <label className="flex items-center gap-2 text-xs text-zinc-600">
+                                            Qtd
+                                            <input
+                                              className="field w-16 px-2 py-1"
+                                              type="number"
+                                              min={1}
+                                              defaultValue={
+                                                Number(line.qty) > 0
+                                                  ? Number(line.qty)
+                                                  : 1
+                                              }
+                                              key={`${line.id}-sum-${line.qty}`}
+                                              onBlur={(e) => {
+                                                const v = Number(e.target.value);
+                                                const cur =
+                                                  Number(line.qty) > 0
+                                                    ? Number(line.qty)
+                                                    : 1;
+                                                if (v !== cur) {
+                                                  void updateLineQty(line.id, v);
+                                                }
+                                              }}
+                                            />
+                                          </label>
+                                        </li>
+                                      );
+                                    })}
+                                  </ul>
+                                  <div className="rounded-md border border-dashed border-zinc-300 bg-white p-3">
+                                    <div className="text-sm font-medium text-zinc-800">
+                                      Adicionar cliente (voto que a planilha não leu)
                                     </div>
-                                    <label className="flex items-center gap-2 text-xs text-zinc-600">
-                                      Qtd
-                                      <input
-                                        className="field w-16 px-2 py-1"
-                                        type="number"
-                                        min={1}
-                                        defaultValue={
-                                          Number(line.qty) > 0
-                                            ? Number(line.qty)
-                                            : 1
-                                        }
-                                        key={`${line.id}-sum-${line.qty}`}
-                                        onBlur={(e) => {
-                                          const v = Number(e.target.value);
-                                          const cur =
-                                            Number(line.qty) > 0
-                                              ? Number(line.qty)
-                                              : 1;
-                                          if (v !== cur) {
-                                            void updateLineQty(line.id, v);
+                                    <p className="mt-0.5 text-xs text-zinc-500">
+                                      Entra como pedido normal desta carta. Quem já
+                                      está na lista não aparece — ajuste a qtd
+                                      acima.
+                                    </p>
+                                    <div className="mt-2 flex flex-wrap items-end gap-2">
+                                      <label className="min-w-[12rem] flex-1 text-xs text-zinc-600">
+                                        Buscar
+                                        <input
+                                          className="field mt-1 text-sm"
+                                          placeholder="Nome ou telefone…"
+                                          value={addVoteSearch}
+                                          onChange={(e) =>
+                                            setAddVoteSearch(e.target.value)
                                           }
-                                        }}
-                                      />
-                                    </label>
-                                  </li>
-                                );
-                              })}
-                            </ul>
+                                        />
+                                      </label>
+                                      <label className="text-xs text-zinc-600">
+                                        Qtd
+                                        <input
+                                          className="field mt-1 w-16 px-2 py-1"
+                                          type="number"
+                                          min={1}
+                                          value={addVoteQty}
+                                          onChange={(e) =>
+                                            setAddVoteQty(Number(e.target.value))
+                                          }
+                                        />
+                                      </label>
+                                    </div>
+                                    <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
+                                      {filtered.length === 0 ? (
+                                        <li className="text-xs text-zinc-500">
+                                          {q
+                                            ? "Nenhum cliente encontrado."
+                                            : "Digite para buscar em todos os clientes, ou cadastre um novo."}
+                                        </li>
+                                      ) : (
+                                        filtered.map((c) => (
+                                          <li key={c.id}>
+                                            <button
+                                              type="button"
+                                              className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-zinc-100"
+                                              disabled={busy}
+                                              onClick={() =>
+                                                void addCustomerToProduct(
+                                                  row.title,
+                                                  c,
+                                                  addVoteQty,
+                                                )
+                                              }
+                                            >
+                                              <span>
+                                                {labelWithPhone(
+                                                  c.name,
+                                                  c.phone || "",
+                                                )}
+                                              </span>
+                                              <span className="text-xs text-emerald-700">
+                                                Adicionar
+                                              </span>
+                                            </button>
+                                          </li>
+                                        ))
+                                      )}
+                                    </ul>
+                                    {addVoteShowNewFor !== row.title ? (
+                                      <button
+                                        type="button"
+                                        className="btn-secondary mt-2 w-full text-sm"
+                                        onClick={() =>
+                                          setAddVoteShowNewFor(row.title)
+                                        }
+                                      >
+                                        Cadastrar cliente novo e adicionar
+                                      </button>
+                                    ) : (
+                                      <div className="mt-2 space-y-2 rounded-md border border-zinc-200 bg-zinc-50 p-2">
+                                        <input
+                                          className="field text-sm"
+                                          placeholder="Nome"
+                                          value={addVoteNewName}
+                                          onChange={(e) =>
+                                            setAddVoteNewName(e.target.value)
+                                          }
+                                        />
+                                        <input
+                                          className="field text-sm"
+                                          placeholder="Telefone / WhatsApp"
+                                          value={addVoteNewPhone}
+                                          onChange={(e) =>
+                                            setAddVoteNewPhone(e.target.value)
+                                          }
+                                        />
+                                        <div className="flex gap-2">
+                                          <button
+                                            type="button"
+                                            className="btn-primary flex-1 text-sm"
+                                            disabled={busy}
+                                            onClick={() =>
+                                              void createCustomerAndAddToProduct(
+                                                row.title,
+                                              )
+                                            }
+                                          >
+                                            Criar e adicionar
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn-secondary text-sm"
+                                            onClick={() =>
+                                              setAddVoteShowNewFor(null)
+                                            }
+                                          >
+                                            Cancelar
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })()}
                           </td>
                         </tr>
                       ) : null}
