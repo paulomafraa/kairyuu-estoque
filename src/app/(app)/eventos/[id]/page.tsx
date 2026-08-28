@@ -80,6 +80,30 @@ function labelWithPhone(name: string, phone: string): string {
   return `${name} (${p})`;
 }
 
+function saleLinePhone(line: EventSaleLine): string {
+  return normalizePhoneDigits(
+    line.phone_digits || line.customers?.phone || "",
+  );
+}
+
+function customerPhoneDigits(
+  customer: Pick<Customer, "phone" | "phone_digits">,
+): string {
+  return normalizePhoneDigits(customer.phone_digits || customer.phone || "");
+}
+
+function findCustomerOnProduct(
+  productLines: EventSaleLine[],
+  customer: Pick<Customer, "phone" | "phone_digits"> & { id?: string | null },
+): EventSaleLine | undefined {
+  const phone = customerPhoneDigits(customer);
+  return productLines.find((l) => {
+    if (customer.id && l.customer_id === customer.id) return true;
+    const lp = saleLinePhone(l);
+    return Boolean(phone && lp && phone === lp);
+  });
+}
+
 function lineUnitPrice(line: EventSaleLine): number | null {
   if (line.unit_price != null && Number.isFinite(Number(line.unit_price))) {
     return Number(line.unit_price);
@@ -1252,25 +1276,43 @@ export default function EventoDetailPage() {
     return null;
   }
 
+  async function removeVoteFromProduct(lineId: string) {
+    const line = lines.find((l) => l.id === lineId);
+    if (!line) return;
+    if (line.paid || line.garage_item_id) {
+      setError(
+        "Esse pedido já está pago ou na caixinha — não dá para excluir por aqui.",
+      );
+      return;
+    }
+    await patchLines(
+      [lineId],
+      {
+        cancelled: true,
+        cancel_reason: "Removido da carta (correção de voto)",
+        cancelled_at: new Date().toISOString(),
+        cancelled_by: meId,
+      },
+      "Removido da carta",
+    );
+  }
+
   async function addCustomerToProduct(
     productTitle: string,
     customer: Pick<Customer, "id" | "name" | "phone" | "phone_digits">,
     qty: number,
   ) {
     const n = Math.max(1, Math.floor(qty) || 1);
-    const existing = lines.find(
+    const productLines = lines.filter(
       (l) =>
         l.product_title === productTitle &&
-        l.customer_id === customer.id &&
         !l.cancelled &&
         !isShelvedSaleLine(l, event?.kind),
     );
-    if (existing) {
-      const cur = Number(existing.qty) > 0 ? Number(existing.qty) : 1;
-      await updateLineQty(existing.id, cur + n);
-      setAddVoteSearch("");
-      setAddVoteQty(1);
-      setInfo("Cliente já estava nesta carta — quantidade somada.");
+    if (findCustomerOnProduct(productLines, customer)) {
+      setError(
+        "Esse número já está nesta carta. Ajuste a quantidade na linha, ou exclua se foi engano.",
+      );
       return;
     }
 
@@ -1329,6 +1371,23 @@ export default function EventoDetailPage() {
     const name = addVoteNewName.trim() || phone;
     if (!phone || phone.length < 10) {
       setError("Informe um telefone válido (10–15 dígitos).");
+      return;
+    }
+    const productLines = lines.filter(
+      (l) =>
+        l.product_title === productTitle &&
+        !l.cancelled &&
+        !isShelvedSaleLine(l, event?.kind),
+    );
+    if (
+      findCustomerOnProduct(productLines, {
+        phone,
+        phone_digits: phone,
+      })
+    ) {
+      setError(
+        "Esse número já está nesta carta. Ajuste a quantidade na linha, ou exclua se foi engano.",
+      );
       return;
     }
     const existing = phoneToCustomer.get(phone);
@@ -2964,6 +3023,14 @@ export default function EventoDetailPage() {
                                   .map((l) => l.customer_id)
                                   .filter((id): id is string => Boolean(id)),
                               );
+                              const alreadyPhones = new Set(
+                                row.lines
+                                  .map((l) => saleLinePhone(l))
+                                  .filter(Boolean),
+                              );
+                              const isAlreadyOnCard = (c: Customer) =>
+                                alreadyIds.has(c.id) ||
+                                alreadyPhones.has(customerPhoneDigits(c));
                               const q = addVoteSearch.trim().toLowerCase();
                               const eventCustomers = participants
                                 .map((p) => {
@@ -2977,7 +3044,8 @@ export default function EventoDetailPage() {
                               const pool = q ? customers : eventCustomers;
                               const filtered = pool
                                 .filter((c) => {
-                                  if (alreadyIds.has(c.id)) return false;
+                                  const already = isAlreadyOnCard(c);
+                                  if (already && !q) return false;
                                   if (!q) return true;
                                   const hay =
                                     `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
@@ -2997,6 +3065,8 @@ export default function EventoDetailPage() {
                                         line.customers?.phone ||
                                         line.phone_digits ||
                                         "";
+                                      const canRemove =
+                                        !line.paid && !line.garage_item_id;
                                       return (
                                         <li
                                           key={line.id}
@@ -3026,30 +3096,43 @@ export default function EventoDetailPage() {
                                                   : "em aberto"}
                                             </div>
                                           </div>
-                                          <label className="flex items-center gap-2 text-xs text-zinc-600">
-                                            Qtd
-                                            <input
-                                              className="field w-16 px-2 py-1"
-                                              type="number"
-                                              min={1}
-                                              defaultValue={
-                                                Number(line.qty) > 0
-                                                  ? Number(line.qty)
-                                                  : 1
-                                              }
-                                              key={`${line.id}-sum-${line.qty}`}
-                                              onBlur={(e) => {
-                                                const v = Number(e.target.value);
-                                                const cur =
+                                          <div className="flex flex-wrap items-center gap-3">
+                                            <label className="flex items-center gap-2 text-xs text-zinc-600">
+                                              Qtd
+                                              <input
+                                                className="field w-16 px-2 py-1"
+                                                type="number"
+                                                min={1}
+                                                defaultValue={
                                                   Number(line.qty) > 0
                                                     ? Number(line.qty)
-                                                    : 1;
-                                                if (v !== cur) {
-                                                  void updateLineQty(line.id, v);
+                                                    : 1
                                                 }
-                                              }}
-                                            />
-                                          </label>
+                                                key={`${line.id}-sum-${line.qty}`}
+                                                onBlur={(e) => {
+                                                  const v = Number(e.target.value);
+                                                  const cur =
+                                                    Number(line.qty) > 0
+                                                      ? Number(line.qty)
+                                                      : 1;
+                                                  if (v !== cur) {
+                                                    void updateLineQty(line.id, v);
+                                                  }
+                                                }}
+                                              />
+                                            </label>
+                                            {canRemove ? (
+                                              <ConfirmButton
+                                                label="Excluir"
+                                                confirmLabel="Confirmar exclusão?"
+                                                className="text-xs font-medium text-red-700 underline decoration-red-200 underline-offset-2"
+                                                disabled={busy}
+                                                onConfirm={() =>
+                                                  removeVoteFromProduct(line.id)
+                                                }
+                                              />
+                                            ) : null}
+                                          </div>
                                         </li>
                                       );
                                     })}
@@ -3059,9 +3142,8 @@ export default function EventoDetailPage() {
                                       Adicionar cliente (voto que a planilha não leu)
                                     </div>
                                     <p className="mt-0.5 text-xs text-zinc-500">
-                                      Entra como pedido normal desta carta. Quem já
-                                      está na lista não aparece — ajuste a qtd
-                                      acima.
+                                      Cada número entra só uma vez nesta carta. Para
+                                      mais unidades, use a quantidade na linha.
                                     </p>
                                     <div className="mt-2 flex flex-wrap items-end gap-2">
                                       <label className="min-w-[12rem] flex-1 text-xs text-zinc-600">
@@ -3096,12 +3178,14 @@ export default function EventoDetailPage() {
                                             : "Digite para buscar em todos os clientes, ou cadastre um novo."}
                                         </li>
                                       ) : (
-                                        filtered.map((c) => (
+                                        filtered.map((c) => {
+                                          const already = isAlreadyOnCard(c);
+                                          return (
                                           <li key={c.id}>
                                             <button
                                               type="button"
-                                              className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-zinc-100"
-                                              disabled={busy}
+                                              className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                              disabled={busy || already}
                                               onClick={() =>
                                                 void addCustomerToProduct(
                                                   row.title,
@@ -3116,12 +3200,17 @@ export default function EventoDetailPage() {
                                                   c.phone || "",
                                                 )}
                                               </span>
-                                              <span className="text-xs text-emerald-700">
-                                                Adicionar
+                                              <span
+                                                className={`text-xs ${already ? "text-zinc-500" : "text-emerald-700"}`}
+                                              >
+                                                {already
+                                                  ? "Já está nesta carta"
+                                                  : "Adicionar"}
                                               </span>
                                             </button>
                                           </li>
-                                        ))
+                                          );
+                                        })
                                       )}
                                     </ul>
                                     {addVoteShowNewFor !== row.title ? (
