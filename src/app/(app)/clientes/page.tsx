@@ -5,6 +5,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
+import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
 import { paymentUrgency } from "@/lib/leilao-resultado";
@@ -299,10 +300,10 @@ export default function ClientesPage() {
         actions={
           <button
             type="button"
-            className="btn-secondary"
+            className="btn-primary"
             onClick={() => setShowImport((v) => !v)}
           >
-            {showImport ? "Fechar importação" : "Importar WhatsApp"}
+            {showImport ? "Fechar importação" : "Importar CSV WhatsApp"}
           </button>
         }
       />
@@ -326,8 +327,20 @@ export default function ClientesPage() {
           <p className="text-sm text-zinc-600">
             No WhatsApp (adm):{" "}
             <code className="rounded bg-zinc-100 px-1">!exportar-clientes nomes</code>{" "}
-            (lista com os nomes que o bot já conhece). Cole o CSV abaixo.
+            (lista com os nomes que o bot já conhece). Arraste o CSV ou cole o
+            texto abaixo.
           </p>
+          <FileDropZone
+            accept=".csv,text/csv,text/plain"
+            disabled={busy}
+            title="Solte o CSV de clientes aqui"
+            hint="Arquivo exportado pelo bot (!exportar-clientes nomes)."
+            onFile={async (file) => {
+              setCsvText(await file.text());
+              setShowImport(true);
+              setInfo(`Arquivo carregado: ${file.name}`);
+            }}
+          />
           <label className="flex items-center gap-2 text-sm text-zinc-700">
             <input
               type="checkbox"
@@ -354,24 +367,43 @@ export default function ClientesPage() {
             onChange={(e) => setCsvText(e.target.value)}
             required
           />
-          <label className="block text-sm text-zinc-600">
-            Ou escolha o arquivo
-            <input
-              className="mt-1 block w-full text-sm"
-              type="file"
-              accept=".csv,text/csv,text/plain"
-              onChange={async (e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                setCsvText(await file.text());
-              }}
-            />
-          </label>
           <button type="submit" className="btn-primary" disabled={busy}>
             {busy ? "Importando..." : "Importar / atualizar"}
           </button>
         </form>
-      ) : null}
+      ) : (
+        <div
+          className="panel mb-6"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={async (e) => {
+            e.preventDefault();
+            const file = e.dataTransfer.files?.[0];
+            if (!file) return;
+            setShowImport(true);
+            setCsvText(await file.text());
+            setInfo(`Arquivo carregado: ${file.name}`);
+          }}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-zinc-900">
+                Importar CSV de clientes
+              </div>
+              <p className="mt-0.5 text-sm text-zinc-600">
+                Arraste o arquivo pra cá ou use o botão{" "}
+                <strong>Importar CSV WhatsApp</strong>.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => setShowImport(true)}
+            >
+              Abrir importação
+            </button>
+          </div>
+        </div>
+      )}
 
       <form onSubmit={onCreate} className="panel mb-6 grid gap-3 sm:grid-cols-3">
         <label className="text-sm">

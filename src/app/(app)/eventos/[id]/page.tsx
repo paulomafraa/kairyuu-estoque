@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/Badge";
 import { EmptyState } from "@/components/EmptyState";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { EventResumoPanel } from "@/components/EventResumoPanel";
+import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { EVENT_STATUS_LABEL, cardLabel } from "@/lib/labels";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
@@ -160,11 +161,16 @@ export default function EventoDetailPage() {
   const [showShelved, setShowShelved] = useState(false);
   const [showShelvedEvent, setShowShelvedEvent] = useState(false);
   const [openProductTitles, setOpenProductTitles] = useState<Record<string, boolean>>({});
-  const [addVoteSearch, setAddVoteSearch] = useState("");
-  const [addVoteQty, setAddVoteQty] = useState(1);
+  const [addVoteSearchByTitle, setAddVoteSearchByTitle] = useState<
+    Record<string, string>
+  >({});
+  const [addVoteQtyByTitle, setAddVoteQtyByTitle] = useState<
+    Record<string, number>
+  >({});
   const [addVoteShowNewFor, setAddVoteShowNewFor] = useState<string | null>(null);
   const [addVoteNewName, setAddVoteNewName] = useState("");
   const [addVoteNewPhone, setAddVoteNewPhone] = useState("");
+  const [importDragging, setImportDragging] = useState(false);
 
   /** Revisão ❓: atribuir dono sem mexer em itens já pagos/organizados. */
   const [reviewLineId, setReviewLineId] = useState<string | null>(null);
@@ -1276,6 +1282,14 @@ export default function EventoDetailPage() {
     return null;
   }
 
+  async function withScrollKeep(fn: () => Promise<void>) {
+    const y = typeof window !== "undefined" ? window.scrollY : 0;
+    await fn();
+    if (typeof window !== "undefined") {
+      requestAnimationFrame(() => window.scrollTo({ top: y }));
+    }
+  }
+
   async function removeVoteFromProduct(lineId: string) {
     const line = lines.find((l) => l.id === lineId);
     if (!line) return;
@@ -1285,16 +1299,18 @@ export default function EventoDetailPage() {
       );
       return;
     }
-    await patchLines(
-      [lineId],
-      {
-        cancelled: true,
-        cancel_reason: "Removido da carta (correção de voto)",
-        cancelled_at: new Date().toISOString(),
-        cancelled_by: meId,
-      },
-      "Removido da carta",
-    );
+    await withScrollKeep(async () => {
+      await patchLines(
+        [lineId],
+        {
+          cancelled: true,
+          cancel_reason: "Removido da carta (correção de voto)",
+          cancelled_at: new Date().toISOString(),
+          cancelled_by: meId,
+        },
+        "Removido da carta",
+      );
+    });
   }
 
   async function addCustomerToProduct(
@@ -1357,13 +1373,13 @@ export default function EventoDetailPage() {
       customer_id: customer.id,
       event_id: eventId,
     });
-    setAddVoteSearch("");
-    setAddVoteQty(1);
+    setAddVoteSearchByTitle((s) => ({ ...s, [productTitle]: "" }));
+    setAddVoteQtyByTitle((s) => ({ ...s, [productTitle]: 1 }));
     setAddVoteShowNewFor(null);
     setAddVoteNewName("");
     setAddVoteNewPhone("");
     setInfo(`Cliente adicionado em ${productTitle}.`);
-    await load();
+    await withScrollKeep(() => load());
   }
 
   async function createCustomerAndAddToProduct(productTitle: string) {
@@ -1390,9 +1406,10 @@ export default function EventoDetailPage() {
       );
       return;
     }
+    const qty = Math.max(1, Number(addVoteQtyByTitle[productTitle]) || 1);
     const existing = phoneToCustomer.get(phone);
     if (existing) {
-      await addCustomerToProduct(productTitle, existing, addVoteQty);
+      await addCustomerToProduct(productTitle, existing, qty);
       return;
     }
     setBusy(true);
@@ -1413,7 +1430,7 @@ export default function EventoDetailPage() {
       setError(err.message);
       return;
     }
-    await addCustomerToProduct(productTitle, data as Customer, addVoteQty);
+    await addCustomerToProduct(productTitle, data as Customer, qty);
   }
 
   async function updateLinePrice(lineId: string, raw: string) {
@@ -2061,13 +2078,6 @@ export default function EventoDetailPage() {
         <div className="flex flex-wrap items-end gap-2">
           <button
             type="button"
-            className="btn-primary"
-            onClick={() => setShowImport((v) => !v)}
-          >
-            Importar planilha do bot
-          </button>
-          <button
-            type="button"
             className="btn-secondary"
             disabled={lines.length === 0}
             onClick={() => downloadCorrectedCsv()}
@@ -2098,6 +2108,193 @@ export default function EventoDetailPage() {
             {showBox ? "Ocultar caixa física" : "Caixa física (opcional)"}
           </button>
         </div>
+      </div>
+
+      <div
+        className={`panel mb-6 space-y-3 ${importDragging ? "ring-2 ring-zinc-900 ring-offset-2" : ""}`}
+        onDragEnter={(e) => {
+          e.preventDefault();
+          if ([...e.dataTransfer.types].includes("Files")) setImportDragging(true);
+        }}
+        onDragOver={(e) => e.preventDefault()}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+            setImportDragging(false);
+          }
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          setImportDragging(false);
+          const f = e.dataTransfer.files?.[0];
+          if (!f || busy) return;
+          const name = f.name.toLowerCase();
+          if (event.kind === "encomenda" && name.endsWith(".csv")) {
+            void uploadEncomendaTemplate(f);
+            return;
+          }
+          setShowImport(true);
+          void onPickFile(f);
+        }}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-zinc-900">
+              Importar planilha do bot
+            </h2>
+            <p className="mt-1 text-sm text-zinc-600">
+              Arraste o arquivo pra esta área ou escolha no botão. Aceita{" "}
+              <strong>.xlsx</strong> / <strong>.xls</strong> do{" "}
+              <code className="rounded bg-zinc-100 px-1">!planilha</code>
+              {event.kind === "encomenda" ? (
+                <> (encomenda) e CSV de template JP/venda.</>
+              ) : (
+                <> (leilão / resultado).</>
+              )}
+            </p>
+          </div>
+          {!showImport ? (
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => setShowImport(true)}
+            >
+              Abrir importação
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={() => setShowImport(false)}
+            >
+              Recolher
+            </button>
+          )}
+        </div>
+
+        {showImport || importDragging ? (
+          <div className="space-y-3">
+            <FileDropZone
+              accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+              disabled={busy}
+              title={
+                importDragging ? "Solte pra importar" : "Solte a planilha aqui"
+              }
+              hint={
+                event.kind === "encomenda"
+                  ? "Resultado do bot (.xlsx) ou template de custos (.csv)."
+                  : "Arquivo Resultado do bot (.xlsx / .xls / .csv)."
+              }
+              onFile={async (f) => {
+                const name = f.name.toLowerCase();
+                if (event.kind === "encomenda" && name.endsWith(".csv")) {
+                  await uploadEncomendaTemplate(f);
+                  return;
+                }
+                await onPickFile(f);
+              }}
+            />
+            <p className="text-sm text-zinc-600">
+              {event.kind === "encomenda" ? (
+                <>
+                  Em <strong>encomenda</strong> só entram votos em{" "}
+                  <strong>Eu quero…</strong> (a opção 💙 é ignorada).
+                </>
+              ) : event.kind === "leilao" ? (
+                <>
+                  Em <strong>leilão</strong> entram os 3 blocos: dono certo,
+                  revisão ❓ e sem votos.
+                </>
+              ) : (
+                <>Importe a aba Resultado do bot.</>
+              )}
+            </p>
+            {event.kind === "leilao" ? (
+              <p className="text-sm text-emerald-800">
+                Neste leilão a importação <strong>sempre</strong> inclui os 3
+                blocos. Se reimportar a mesma planilha, só entram cartas que
+                ainda faltam.
+              </p>
+            ) : (
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={includeReview}
+                  onChange={(e) => setIncludeReview(e.target.checked)}
+                />
+                Incluir também linhas de revisão manual (❓)
+              </label>
+            )}
+            {importPreview ? (
+              <div className="space-y-3 text-sm text-zinc-700">
+                <p>
+                  Aba/arquivo: <strong>{importPreview.sheetUsed}</strong>
+                </p>
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
+                    <div className="font-semibold text-emerald-900">
+                      Dono certo ({importPreview.certain.length})
+                    </div>
+                    <ul className="mt-1 max-h-32 overflow-y-auto overscroll-contain text-xs text-emerald-900/80">
+                      {importPreview.certain.slice(0, 40).map((l, i) => (
+                        <li key={`c-${i}`}>
+                          {l.product_title}
+                          {l.customer_name_snapshot
+                            ? ` · ${l.customer_name_snapshot}`
+                            : ""}
+                        </li>
+                      ))}
+                      {importPreview.certain.length > 40 ? (
+                        <li>… +{importPreview.certain.length - 40}</li>
+                      ) : null}
+                    </ul>
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
+                    <div className="font-semibold text-amber-900">
+                      Revisão ❓ ({importPreview.review.length})
+                    </div>
+                    <p className="text-xs text-amber-800/80">
+                      Teve voto, mas o bot não definiu o ganhador.
+                    </p>
+                    <ul className="mt-1 max-h-32 overflow-y-auto overscroll-contain text-xs text-amber-900/80">
+                      {importPreview.review.slice(0, 40).map((l, i) => (
+                        <li key={`r-${i}`}>{l.product_title}</li>
+                      ))}
+                      {importPreview.review.length > 40 ? (
+                        <li>… +{importPreview.review.length - 40}</li>
+                      ) : null}
+                    </ul>
+                  </div>
+                  <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
+                    <div className="font-semibold text-zinc-800">
+                      Sem votos ({importPreview.noVotes.length})
+                    </div>
+                    <ul className="mt-1 max-h-32 overflow-y-auto overscroll-contain text-xs text-zinc-600">
+                      {importPreview.noVotes.slice(0, 40).map((l, i) => (
+                        <li key={`n-${i}`}>{l.product_title}</li>
+                      ))}
+                      {importPreview.noVotes.length > 40 ? (
+                        <li>… +{importPreview.noVotes.length - 40}</li>
+                      ) : null}
+                    </ul>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={busy}
+                  onClick={() => void confirmImport()}
+                >
+                  Confirmar importação
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <p className="text-sm text-zinc-500">
+            Dica: dá pra arrastar o arquivo direto em cima deste bloco, sem
+            abrir nada.
+          </p>
+        )}
       </div>
 
       {event.kind === "encomenda" && productCosts.length > 0 ? (
@@ -2183,120 +2380,6 @@ export default function EventoDetailPage() {
             </button>
           </div>
         </form>
-      ) : null}
-
-      {showImport ? (
-        <div className="panel mb-6 space-y-3">
-          <h2 className="font-semibold">Importar Resultado (!planilha)</h2>
-          <p className="text-sm text-zinc-600">
-            Use o <strong>.xlsx</strong> do bot (aba Resultado).{" "}
-            {event.kind === "encomenda" ? (
-              <>
-                Em <strong>encomenda</strong> só entram votos em{" "}
-                <strong>Eu quero…</strong> (a opção 💙 é ignorada).
-              </>
-            ) : event.kind === "leilao" ? (
-              <>
-                Em <strong>leilão</strong> o Resultado já vem em 3 blocos: dono
-                certo (arremate/lance), revisão ❓ (teve voto mas o bot não soube
-                quem ganhou) e sem votos. Os três entram por padrão para
-                controlar tudo que saiu na rodada.
-              </>
-            ) : (
-              <>Importe a aba Resultado do bot.</>
-            )}
-          </p>
-          <input
-            type="file"
-            accept=".xlsx,.xls,.csv,text/csv"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void onPickFile(f);
-            }}
-          />
-          {event.kind === "leilao" ? (
-            <p className="text-sm text-emerald-800">
-              Neste leilão a importação <strong>sempre</strong> inclui os 3
-              blocos (dono certo, revisão ❓ e sem votos). Se reimportar a mesma
-              planilha, só entram cartas que ainda faltam.
-            </p>
-          ) : (
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={includeReview}
-                onChange={(e) => setIncludeReview(e.target.checked)}
-              />
-              Incluir também linhas de revisão manual (❓)
-            </label>
-          )}
-          {importPreview ? (
-            <div className="space-y-3 text-sm text-zinc-700">
-              <p>
-                Aba/arquivo: <strong>{importPreview.sheetUsed}</strong>
-              </p>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
-                  <div className="font-semibold text-emerald-900">
-                    Dono certo ({importPreview.certain.length})
-                  </div>
-                  <ul className="mt-1 max-h-32 overflow-y-auto text-xs text-emerald-900/80">
-                    {importPreview.certain.slice(0, 40).map((l, i) => (
-                      <li key={`c-${i}`}>
-                        {l.product_title}
-                        {l.customer_name_snapshot
-                          ? ` · ${l.customer_name_snapshot}`
-                          : ""}
-                      </li>
-                    ))}
-                    {importPreview.certain.length > 40 ? (
-                      <li>… +{importPreview.certain.length - 40}</li>
-                    ) : null}
-                  </ul>
-                </div>
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
-                  <div className="font-semibold text-amber-900">
-                    Revisão ❓ ({importPreview.review.length})
-                  </div>
-                  <p className="text-xs text-amber-800/80">
-                    Teve voto, mas o bot não definiu o ganhador.
-                  </p>
-                  <ul className="mt-1 max-h-32 overflow-y-auto text-xs text-amber-900/80">
-                    {importPreview.review.slice(0, 40).map((l, i) => (
-                      <li key={`r-${i}`}>{l.product_title}</li>
-                    ))}
-                    {importPreview.review.length > 40 ? (
-                      <li>… +{importPreview.review.length - 40}</li>
-                    ) : null}
-                  </ul>
-                </div>
-                <div className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
-                  <div className="font-semibold text-zinc-800">
-                    Sem votos ({importPreview.noVotes.length})
-                  </div>
-                  <ul className="mt-1 max-h-32 overflow-y-auto text-xs text-zinc-600">
-                    {importPreview.noVotes.slice(0, 40).map((l, i) => (
-                      <li key={`n-${i}`}>{l.product_title}</li>
-                    ))}
-                    {importPreview.noVotes.length > 40 ? (
-                      <li>… +{importPreview.noVotes.length - 40}</li>
-                    ) : null}
-                  </ul>
-                </div>
-              </div>
-              <div>
-                <button
-                  type="button"
-                  className="btn-primary"
-                  disabled={busy}
-                  onClick={() => void confirmImport()}
-                >
-                  Confirmar importação
-                </button>
-              </div>
-            </div>
-          ) : null}
-        </div>
       ) : null}
 
       {event.kind === "leilao" &&
@@ -2924,7 +3007,8 @@ export default function EventoDetailPage() {
               <h2 className="font-semibold">Resumo das encomendas</h2>
               <p className="mt-1 text-sm text-zinc-600">
                 Cada voto em Eu quero… conta 1 un. por padrão. Votos 💙 ficam na aba
-                retrátil e não entram neste resumo.
+                retrátil e não entram neste resumo. Dá pra deixar várias cartas
+                abertas ao mesmo tempo.
               </p>
             </div>
             <button
@@ -2936,349 +3020,314 @@ export default function EventoDetailPage() {
               Chegou tudo desta rodada
             </button>
           </div>
-          <div className="table-wrap">
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Produto</th>
-                  <th>Pedidos</th>
-                  <th>Un. encomendadas</th>
-                  <th>Chegou no estoque</th>
-                  <th>Falta</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {productSummary.map((row) => {
-                  const falta = Math.max(0, row.ordered - row.arrived);
-                  const open = Boolean(openProductTitles[row.title]);
-                  return (
-                    <Fragment key={row.title}>
-                      <tr>
-                        <td>
-                          <button
-                            type="button"
-                            className="flex w-full items-start gap-2 text-left"
-                            onClick={() =>
-                              setOpenProductTitles((s) => ({
-                                ...s,
-                                [row.title]: !s[row.title],
-                              }))
-                            }
-                          >
-                            <span className="mt-0.5 text-zinc-400">
-                              {open ? "▾" : "▸"}
-                            </span>
-                            <span>
-                              <span className="font-medium">{row.title}</span>
-                              <span className="mt-0.5 block text-xs font-normal text-zinc-500">
-                                {open
-                                  ? "ocultar quem pediu"
-                                  : "ver clientes e ajustar qtd"}
-                              </span>
-                            </span>
-                          </button>
-                        </td>
-                        <td>{row.people}</td>
-                        <td>{row.ordered}</td>
-                        <td>
-                          <input
-                            className="field w-24"
-                            type="number"
-                            min={0}
-                            defaultValue={row.arrived}
-                            key={`${row.title}-${row.arrived}`}
-                            onBlur={(e) => {
-                              const v = Number(e.target.value);
-                              if (v !== row.arrived) void saveArrived(row.title, v);
-                            }}
-                          />
-                        </td>
-                        <td>
-                          {falta > 0 ? (
-                            <Badge tone="warn">{falta}</Badge>
-                          ) : (
-                            <Badge tone="good">ok</Badge>
-                          )}
-                        </td>
-                        <td>
-                          <button
-                            type="button"
-                            className="btn-secondary whitespace-nowrap px-2 py-1 text-xs"
-                            disabled={falta === 0 || busy}
-                            onClick={() =>
-                              void markProductFullyArrived(row.title, row.ordered)
-                            }
-                          >
-                            Chegaram todas
-                          </button>
-                        </td>
-                      </tr>
-                      {open ? (
-                        <tr className="bg-zinc-50">
-                          <td colSpan={6} className="!py-3">
-                            {(() => {
-                              const alreadyIds = new Set(
-                                row.lines
-                                  .map((l) => l.customer_id)
-                                  .filter((id): id is string => Boolean(id)),
-                              );
-                              const alreadyPhones = new Set(
-                                row.lines
-                                  .map((l) => saleLinePhone(l))
-                                  .filter(Boolean),
-                              );
-                              const isAlreadyOnCard = (c: Customer) =>
-                                alreadyIds.has(c.id) ||
-                                alreadyPhones.has(customerPhoneDigits(c));
-                              const q = addVoteSearch.trim().toLowerCase();
-                              const eventCustomers = participants
-                                .map((p) => {
-                                  if (!p.customer_id) return null;
-                                  return (
-                                    customers.find((x) => x.id === p.customer_id) ||
-                                    null
-                                  );
-                                })
-                                .filter(Boolean) as Customer[];
-                              const pool = q ? customers : eventCustomers;
-                              const filtered = pool
-                                .filter((c) => {
-                                  const already = isAlreadyOnCard(c);
-                                  if (already && !q) return false;
-                                  if (!q) return true;
-                                  const hay =
-                                    `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
-                                  return hay.includes(q);
-                                })
-                                .slice(0, 30);
-                              return (
-                                <div className="space-y-3 px-2">
-                                  <ul className="space-y-2">
-                                    {row.lines.map((line) => {
-                                      const who =
-                                        line.customers?.name ||
-                                        line.customer_name_snapshot ||
-                                        line.phone_digits ||
-                                        "Sem cliente";
-                                      const phone =
-                                        line.customers?.phone ||
-                                        line.phone_digits ||
-                                        "";
-                                      const canRemove =
-                                        !line.paid && !line.garage_item_id;
-                                      return (
-                                        <li
-                                          key={line.id}
-                                          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm"
-                                        >
-                                          <div className="min-w-0">
-                                            {line.customer_id ? (
-                                              <Link
-                                                href={`/clientes/${line.customer_id}`}
-                                                className="font-medium underline decoration-zinc-300 underline-offset-2"
-                                              >
-                                                {who}
-                                                {phone && who !== phone
-                                                  ? ` (${phone})`
-                                                  : ""}
-                                              </Link>
-                                            ) : (
-                                              <span className="font-medium">
-                                                {who}
-                                              </span>
-                                            )}
-                                            <div className="text-xs text-zinc-500">
-                                              {line.paid
-                                                ? "pago"
-                                                : line.charged
-                                                  ? "cobrado"
-                                                  : "em aberto"}
-                                            </div>
-                                          </div>
-                                          <div className="flex flex-wrap items-center gap-3">
-                                            <label className="flex items-center gap-2 text-xs text-zinc-600">
-                                              Qtd
-                                              <input
-                                                className="field w-16 px-2 py-1"
-                                                type="number"
-                                                min={1}
-                                                defaultValue={
-                                                  Number(line.qty) > 0
-                                                    ? Number(line.qty)
-                                                    : 1
-                                                }
-                                                key={`${line.id}-sum-${line.qty}`}
-                                                onBlur={(e) => {
-                                                  const v = Number(e.target.value);
-                                                  const cur =
-                                                    Number(line.qty) > 0
-                                                      ? Number(line.qty)
-                                                      : 1;
-                                                  if (v !== cur) {
-                                                    void updateLineQty(line.id, v);
-                                                  }
-                                                }}
-                                              />
-                                            </label>
-                                            {canRemove ? (
-                                              <ConfirmButton
-                                                label="Excluir"
-                                                confirmLabel="Confirmar exclusão?"
-                                                className="text-xs font-medium text-red-700 underline decoration-red-200 underline-offset-2"
-                                                disabled={busy}
-                                                onConfirm={() =>
-                                                  removeVoteFromProduct(line.id)
-                                                }
-                                              />
-                                            ) : null}
-                                          </div>
-                                        </li>
-                                      );
-                                    })}
-                                  </ul>
-                                  <div className="rounded-md border border-dashed border-zinc-300 bg-white p-3">
-                                    <div className="text-sm font-medium text-zinc-800">
-                                      Adicionar cliente (voto que a planilha não leu)
-                                    </div>
-                                    <p className="mt-0.5 text-xs text-zinc-500">
-                                      Cada número entra só uma vez nesta carta. Para
-                                      mais unidades, use a quantidade na linha.
-                                    </p>
-                                    <div className="mt-2 flex flex-wrap items-end gap-2">
-                                      <label className="min-w-[12rem] flex-1 text-xs text-zinc-600">
-                                        Buscar
-                                        <input
-                                          className="field mt-1 text-sm"
-                                          placeholder="Nome ou telefone…"
-                                          value={addVoteSearch}
-                                          onChange={(e) =>
-                                            setAddVoteSearch(e.target.value)
-                                          }
-                                        />
-                                      </label>
-                                      <label className="text-xs text-zinc-600">
-                                        Qtd
-                                        <input
-                                          className="field mt-1 w-16 px-2 py-1"
-                                          type="number"
-                                          min={1}
-                                          value={addVoteQty}
-                                          onChange={(e) =>
-                                            setAddVoteQty(Number(e.target.value))
-                                          }
-                                        />
-                                      </label>
-                                    </div>
-                                    <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">
-                                      {filtered.length === 0 ? (
-                                        <li className="text-xs text-zinc-500">
-                                          {q
-                                            ? "Nenhum cliente encontrado."
-                                            : "Digite para buscar em todos os clientes, ou cadastre um novo."}
-                                        </li>
-                                      ) : (
-                                        filtered.map((c) => {
-                                          const already = isAlreadyOnCard(c);
-                                          return (
-                                          <li key={c.id}>
-                                            <button
-                                              type="button"
-                                              className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
-                                              disabled={busy || already}
-                                              onClick={() =>
-                                                void addCustomerToProduct(
-                                                  row.title,
-                                                  c,
-                                                  addVoteQty,
-                                                )
-                                              }
-                                            >
-                                              <span>
-                                                {labelWithPhone(
-                                                  c.name,
-                                                  c.phone || "",
-                                                )}
-                                              </span>
-                                              <span
-                                                className={`text-xs ${already ? "text-zinc-500" : "text-emerald-700"}`}
-                                              >
-                                                {already
-                                                  ? "Já está nesta carta"
-                                                  : "Adicionar"}
-                                              </span>
-                                            </button>
-                                          </li>
-                                          );
-                                        })
-                                      )}
-                                    </ul>
-                                    {addVoteShowNewFor !== row.title ? (
-                                      <button
-                                        type="button"
-                                        className="btn-secondary mt-2 w-full text-sm"
-                                        onClick={() =>
-                                          setAddVoteShowNewFor(row.title)
-                                        }
-                                      >
-                                        Cadastrar cliente novo e adicionar
-                                      </button>
-                                    ) : (
-                                      <div className="mt-2 space-y-2 rounded-md border border-zinc-200 bg-zinc-50 p-2">
-                                        <input
-                                          className="field text-sm"
-                                          placeholder="Nome"
-                                          value={addVoteNewName}
-                                          onChange={(e) =>
-                                            setAddVoteNewName(e.target.value)
-                                          }
-                                        />
-                                        <input
-                                          className="field text-sm"
-                                          placeholder="Telefone / WhatsApp"
-                                          value={addVoteNewPhone}
-                                          onChange={(e) =>
-                                            setAddVoteNewPhone(e.target.value)
-                                          }
-                                        />
-                                        <div className="flex gap-2">
-                                          <button
-                                            type="button"
-                                            className="btn-primary flex-1 text-sm"
-                                            disabled={busy}
-                                            onClick={() =>
-                                              void createCustomerAndAddToProduct(
-                                                row.title,
-                                              )
-                                            }
-                                          >
-                                            Criar e adicionar
-                                          </button>
-                                          <button
-                                            type="button"
-                                            className="btn-secondary text-sm"
-                                            onClick={() =>
-                                              setAddVoteShowNewFor(null)
-                                            }
-                                          >
-                                            Cancelar
-                                          </button>
-                                        </div>
-                                      </div>
-                                    )}
-                                  </div>
+          <ul className="space-y-3">
+            {productSummary.map((row) => {
+              const falta = Math.max(0, row.ordered - row.arrived);
+              const open = Boolean(openProductTitles[row.title]);
+              const voteSearch = addVoteSearchByTitle[row.title] || "";
+              const voteQty = Math.max(1, Number(addVoteQtyByTitle[row.title]) || 1);
+              const alreadyIds = new Set(
+                row.lines
+                  .map((l) => l.customer_id)
+                  .filter((id): id is string => Boolean(id)),
+              );
+              const alreadyPhones = new Set(
+                row.lines.map((l) => saleLinePhone(l)).filter(Boolean),
+              );
+              const isAlreadyOnCard = (c: Customer) =>
+                alreadyIds.has(c.id) ||
+                alreadyPhones.has(customerPhoneDigits(c));
+              const q = voteSearch.trim().toLowerCase();
+              const eventCustomers = participants
+                .map((p) => {
+                  if (!p.customer_id) return null;
+                  return customers.find((x) => x.id === p.customer_id) || null;
+                })
+                .filter(Boolean) as Customer[];
+              const pool = q ? customers : eventCustomers;
+              const filtered = pool
+                .filter((c) => {
+                  const already = isAlreadyOnCard(c);
+                  if (already && !q) return false;
+                  if (!q) return true;
+                  const hay =
+                    `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
+                  return hay.includes(q);
+                })
+                .slice(0, 30);
+              return (
+                <li
+                  key={row.title}
+                  className="rounded-lg border border-zinc-200 bg-white"
+                >
+                  <div className="flex flex-wrap items-start gap-3 px-3 py-3">
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 text-left"
+                      onClick={() =>
+                        setOpenProductTitles((s) => ({
+                          ...s,
+                          [row.title]: !s[row.title],
+                        }))
+                      }
+                    >
+                      <span className="mr-2 text-zinc-400">{open ? "▾" : "▸"}</span>
+                      <span className="font-medium text-zinc-900">{row.title}</span>
+                      <span className="mt-0.5 block pl-5 text-xs text-zinc-500">
+                        {open
+                          ? "ocultar quem pediu · outras cartas continuam abertas"
+                          : "ver clientes e ajustar qtd"}
+                      </span>
+                    </button>
+                    <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-700">
+                      <span>
+                        <span className="text-zinc-500">Pedidos</span> {row.people}
+                      </span>
+                      <span>
+                        <span className="text-zinc-500">Un.</span> {row.ordered}
+                      </span>
+                      <label className="flex items-center gap-1 text-xs text-zinc-600">
+                        Chegou
+                        <input
+                          className="field w-20 px-2 py-1"
+                          type="number"
+                          min={0}
+                          defaultValue={row.arrived}
+                          key={`${row.title}-${row.arrived}`}
+                          onBlur={(e) => {
+                            const v = Number(e.target.value);
+                            if (v !== row.arrived) void saveArrived(row.title, v);
+                          }}
+                        />
+                      </label>
+                      {falta > 0 ? (
+                        <Badge tone="warn">falta {falta}</Badge>
+                      ) : (
+                        <Badge tone="good">ok</Badge>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-secondary whitespace-nowrap px-2 py-1 text-xs"
+                        disabled={falta === 0 || busy}
+                        onClick={() =>
+                          void markProductFullyArrived(row.title, row.ordered)
+                        }
+                      >
+                        Chegaram todas
+                      </button>
+                    </div>
+                  </div>
+                  {open ? (
+                    <div className="space-y-3 border-t border-zinc-100 bg-zinc-50 px-3 py-3">
+                      <ul className="space-y-2">
+                        {row.lines.map((line) => {
+                          const who =
+                            line.customers?.name ||
+                            line.customer_name_snapshot ||
+                            line.phone_digits ||
+                            "Sem cliente";
+                          const phone =
+                            line.customers?.phone || line.phone_digits || "";
+                          const canRemove = !line.paid && !line.garage_item_id;
+                          return (
+                            <li
+                              key={line.id}
+                              className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm"
+                            >
+                              <div className="min-w-0">
+                                {line.customer_id ? (
+                                  <Link
+                                    href={`/clientes/${line.customer_id}`}
+                                    className="font-medium underline decoration-zinc-300 underline-offset-2"
+                                  >
+                                    {who}
+                                    {phone && who !== phone ? ` (${phone})` : ""}
+                                  </Link>
+                                ) : (
+                                  <span className="font-medium">{who}</span>
+                                )}
+                                <div className="text-xs text-zinc-500">
+                                  {line.paid
+                                    ? "pago"
+                                    : line.charged
+                                      ? "cobrado"
+                                      : "em aberto"}
                                 </div>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-3">
+                                <label className="flex items-center gap-2 text-xs text-zinc-600">
+                                  Qtd
+                                  <input
+                                    className="field w-16 px-2 py-1"
+                                    type="number"
+                                    min={1}
+                                    defaultValue={
+                                      Number(line.qty) > 0 ? Number(line.qty) : 1
+                                    }
+                                    key={`${line.id}-sum-${line.qty}`}
+                                    onBlur={(e) => {
+                                      const v = Number(e.target.value);
+                                      const cur =
+                                        Number(line.qty) > 0
+                                          ? Number(line.qty)
+                                          : 1;
+                                      if (v !== cur) {
+                                        void withScrollKeep(() =>
+                                          updateLineQty(line.id, v),
+                                        );
+                                      }
+                                    }}
+                                  />
+                                </label>
+                                {canRemove ? (
+                                  <ConfirmButton
+                                    label="Excluir"
+                                    confirmLabel="Confirmar exclusão?"
+                                    className="text-xs font-medium text-red-700 underline decoration-red-200 underline-offset-2"
+                                    disabled={busy}
+                                    onConfirm={() =>
+                                      removeVoteFromProduct(line.id)
+                                    }
+                                  />
+                                ) : null}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      <div className="rounded-md border border-dashed border-zinc-300 bg-white p-3">
+                        <div className="text-sm font-medium text-zinc-800">
+                          Adicionar cliente (voto que a planilha não leu)
+                        </div>
+                        <p className="mt-0.5 text-xs text-zinc-500">
+                          Cada número entra só uma vez nesta carta. Para mais
+                          unidades, use a quantidade na linha.
+                        </p>
+                        <div className="mt-2 flex flex-wrap items-end gap-2">
+                          <label className="min-w-[12rem] flex-1 text-xs text-zinc-600">
+                            Buscar
+                            <input
+                              className="field mt-1 text-sm"
+                              placeholder="Nome ou telefone…"
+                              value={voteSearch}
+                              onChange={(e) =>
+                                setAddVoteSearchByTitle((s) => ({
+                                  ...s,
+                                  [row.title]: e.target.value,
+                                }))
+                              }
+                            />
+                          </label>
+                          <label className="text-xs text-zinc-600">
+                            Qtd
+                            <input
+                              className="field mt-1 w-16 px-2 py-1"
+                              type="number"
+                              min={1}
+                              value={voteQty}
+                              onChange={(e) =>
+                                setAddVoteQtyByTitle((s) => ({
+                                  ...s,
+                                  [row.title]: Number(e.target.value),
+                                }))
+                              }
+                            />
+                          </label>
+                        </div>
+                        <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto overscroll-contain">
+                          {filtered.length === 0 ? (
+                            <li className="text-xs text-zinc-500">
+                              {q
+                                ? "Nenhum cliente encontrado."
+                                : "Digite para buscar em todos os clientes, ou cadastre um novo."}
+                            </li>
+                          ) : (
+                            filtered.map((c) => {
+                              const already = isAlreadyOnCard(c);
+                              return (
+                                <li key={c.id}>
+                                  <button
+                                    type="button"
+                                    className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                    disabled={busy || already}
+                                    onClick={() =>
+                                      void addCustomerToProduct(
+                                        row.title,
+                                        c,
+                                        voteQty,
+                                      )
+                                    }
+                                  >
+                                    <span>
+                                      {labelWithPhone(c.name, c.phone || "")}
+                                    </span>
+                                    <span
+                                      className={`text-xs ${already ? "text-zinc-500" : "text-emerald-700"}`}
+                                    >
+                                      {already
+                                        ? "Já está nesta carta"
+                                        : "Adicionar"}
+                                    </span>
+                                  </button>
+                                </li>
                               );
-                            })()}
-                          </td>
-                        </tr>
-                      ) : null}
-                    </Fragment>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                            })
+                          )}
+                        </ul>
+                        {addVoteShowNewFor !== row.title ? (
+                          <button
+                            type="button"
+                            className="btn-secondary mt-2 w-full text-sm"
+                            onClick={() => setAddVoteShowNewFor(row.title)}
+                          >
+                            Cadastrar cliente novo e adicionar
+                          </button>
+                        ) : (
+                          <div className="mt-2 space-y-2 rounded-md border border-zinc-200 bg-zinc-50 p-2">
+                            <input
+                              className="field text-sm"
+                              placeholder="Nome"
+                              value={addVoteNewName}
+                              onChange={(e) =>
+                                setAddVoteNewName(e.target.value)
+                              }
+                            />
+                            <input
+                              className="field text-sm"
+                              placeholder="Telefone / WhatsApp"
+                              value={addVoteNewPhone}
+                              onChange={(e) =>
+                                setAddVoteNewPhone(e.target.value)
+                              }
+                            />
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                className="btn-primary flex-1 text-sm"
+                                disabled={busy}
+                                onClick={() =>
+                                  void createCustomerAndAddToProduct(row.title)
+                                }
+                              >
+                                Criar e adicionar
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-secondary text-sm"
+                                onClick={() => setAddVoteShowNewFor(null)}
+                              >
+                                Cancelar
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
         </section>
       ) : null}
 
