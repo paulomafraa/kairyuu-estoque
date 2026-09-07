@@ -21,6 +21,7 @@ import {
   isEncInterestOption,
   parseMoneyFromOption,
   classifyStoredLeilaoLine,
+  saleLineImportDedupeKey,
   type ParsedSaleLine,
 } from "@/lib/leilao-resultado";
 import {
@@ -491,12 +492,16 @@ export default function EventoDetailPage() {
     const arrivedMap = new Map(
       productStock.map((s) => [s.product_title, s.qty_arrived] as const),
     );
+    const pedidoMap = new Map(
+      productStock.map((s) => [s.product_title, Boolean(s.pedido_feito)] as const),
+    );
     const map = new Map<
       string,
       {
         title: string;
         ordered: number;
         arrived: number;
+        pedidoFeito: boolean;
         people: number;
         lines: EventSaleLine[];
       }
@@ -511,6 +516,7 @@ export default function EventoDetailPage() {
           title,
           ordered: 0,
           arrived: arrivedMap.get(title) ?? 0,
+          pedidoFeito: pedidoMap.get(title) ?? false,
           people: 0,
           lines: [],
         };
@@ -791,17 +797,9 @@ export default function EventoDetailPage() {
         return;
       }
 
-      // Uma enquete = uma carta: não duplicar pelo poll_id + título
-      const existingPollProducts = new Set(
-        lines.map((l) =>
-          `${l.poll_id}|${l.product_title}`.toLowerCase().trim(),
-        ),
-      );
-      // Fallback sem poll_id: título + status
-      const existingTitleStatus = new Set(
-        lines.map((l) =>
-          `${l.product_title}|${l.import_status}`.toLowerCase().trim(),
-        ),
+      // Leilão: 1 linha por enquete. Encomenda: 1 linha por (carta + cliente).
+      const existingKeys = new Set(
+        lines.map((l) => saleLineImportDedupeKey(l, event?.kind)),
       );
 
       let inserted = 0;
@@ -811,16 +809,8 @@ export default function EventoDetailPage() {
       const chunk: Record<string, unknown>[] = [];
 
       for (const row of toImport) {
-        const pollKey = `${row.poll_id}|${row.product_title}`
-          .toLowerCase()
-          .trim();
-        const titleKey = `${row.product_title}|${row.import_status}`
-          .toLowerCase()
-          .trim();
-        if (
-          (row.poll_id && existingPollProducts.has(pollKey)) ||
-          (!row.poll_id && existingTitleStatus.has(titleKey))
-        ) {
+        const key = saleLineImportDedupeKey(row, event?.kind);
+        if (existingKeys.has(key)) {
           skipped += 1;
           continue;
         }
@@ -854,8 +844,7 @@ export default function EventoDetailPage() {
                 : "",
           created_by: meId,
         });
-        if (row.poll_id) existingPollProducts.add(pollKey);
-        existingTitleStatus.add(titleKey);
+        existingKeys.add(key);
         if (row.import_status === "verificar_manual") insertedReview += 1;
         if (row.import_status === "sem_voto") insertedNoVotes += 1;
         if (chunk.length >= 80) {
@@ -1924,19 +1913,59 @@ export default function EventoDetailPage() {
 
   async function saveArrived(title: string, qtyArrived: number) {
     const n = Math.max(0, Math.floor(qtyArrived) || 0);
+    const current = productStock.find((s) => s.product_title === title);
     const { error: err } = await supabase.from("event_product_stock").upsert(
       {
         event_id: eventId,
         product_title: title,
         qty_arrived: n,
+        pedido_feito: current?.pedido_feito ?? false,
+        pedido_feito_at: current?.pedido_feito_at ?? null,
+        pedido_feito_by: current?.pedido_feito_by ?? null,
         updated_at: new Date().toISOString(),
         updated_by: meId,
       },
       { onConflict: "event_id,product_title" },
     );
-    if (err) setError(err.message);
-    else {
+    if (err) {
+      setError(
+        err.message.includes("pedido_feito")
+          ? `${err.message} — rode supabase/migration_encomenda_pedido_feito.sql`
+          : err.message,
+      );
+    } else {
       setInfo(`Chegada atualizada: ${title}`);
+      await load();
+    }
+  }
+
+  async function setPedidoFeito(title: string, value: boolean) {
+    const current = productStock.find((s) => s.product_title === title);
+    const { error: err } = await supabase.from("event_product_stock").upsert(
+      {
+        event_id: eventId,
+        product_title: title,
+        qty_arrived: current?.qty_arrived ?? 0,
+        pedido_feito: value,
+        pedido_feito_at: value ? new Date().toISOString() : null,
+        pedido_feito_by: value ? meId : null,
+        updated_at: new Date().toISOString(),
+        updated_by: meId,
+      },
+      { onConflict: "event_id,product_title" },
+    );
+    if (err) {
+      setError(
+        err.message.includes("pedido_feito")
+          ? `${err.message} — rode supabase/migration_encomenda_pedido_feito.sql`
+          : err.message,
+      );
+    } else {
+      setInfo(
+        value
+          ? `Pedido JP marcado: ${title}`
+          : `Pedido JP desmarcado: ${title}`,
+      );
       await load();
     }
   }
@@ -1950,13 +1979,19 @@ export default function EventoDetailPage() {
     setBusy(true);
     setError(null);
     try {
-      const rows = productSummary.map((row) => ({
-        event_id: eventId,
-        product_title: row.title,
-        qty_arrived: row.ordered,
-        updated_at: new Date().toISOString(),
-        updated_by: meId,
-      }));
+      const rows = productSummary.map((row) => {
+        const current = productStock.find((s) => s.product_title === row.title);
+        return {
+          event_id: eventId,
+          product_title: row.title,
+          qty_arrived: row.ordered,
+          pedido_feito: current?.pedido_feito ?? false,
+          pedido_feito_at: current?.pedido_feito_at ?? null,
+          pedido_feito_by: current?.pedido_feito_by ?? null,
+          updated_at: new Date().toISOString(),
+          updated_by: meId,
+        };
+      });
       const { error: err } = await supabase
         .from("event_product_stock")
         .upsert(rows, { onConflict: "event_id,product_title" });
@@ -2197,7 +2232,9 @@ export default function EventoDetailPage() {
               {event.kind === "encomenda" ? (
                 <>
                   Em <strong>encomenda</strong> só entram votos em{" "}
-                  <strong>Eu quero…</strong> (a opção 💙 é ignorada).
+                  <strong>Eu quero…</strong> (a opção 💙 é ignorada). Vários
+                  clientes na mesma carta entram normalmente. Reimportar só
+                  adiciona quem ainda faltava.
                 </>
               ) : event.kind === "leilao" ? (
                 <>
@@ -3080,6 +3117,17 @@ export default function EventoDetailPage() {
                       </span>
                     </button>
                     <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-700">
+                      <label className="flex items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-700">
+                        <input
+                          type="checkbox"
+                          checked={row.pedidoFeito}
+                          disabled={busy}
+                          onChange={(e) =>
+                            void setPedidoFeito(row.title, e.target.checked)
+                          }
+                        />
+                        Pedido feito
+                      </label>
                       <span>
                         <span className="text-zinc-500">Pedidos</span> {row.people}
                       </span>

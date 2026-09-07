@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
+import { EncomendaCentralBoard } from "@/components/EncomendaCentralBoard";
 import { createClient } from "@/lib/supabase/client";
 import { ORDER_STATUS_FLOW, ORDER_STATUS_LABEL, cardLabel } from "@/lib/labels";
 import type { Card, Customer, Order, OrderStatus, Profile } from "@/lib/types";
@@ -28,9 +29,11 @@ function fmtDay(iso: string | null | undefined) {
 }
 
 type GroupMode = "status" | "customer";
+type PageTab = "central" | "avulsos";
 
 export default function EncomendasPage() {
   const supabase = useMemo(() => createClient(), []);
+  const [tab, setTab] = useState<PageTab>("central");
   const [orders, setOrders] = useState<Order[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
@@ -337,9 +340,38 @@ export default function EncomendasPage() {
     <div>
       <PageHeader
         title="Encomendas"
-        description="Pipeline Japão → Brasil → sede → enviado → entregue. Toda encomenda fica ligada a um cliente. Só entra no estoque na chegada na sede."
+        description="Central de todas as rodadas (pedido JP, chegada e envio) e pedidos avulsos fora das enquetes."
       />
 
+      <div className="mb-6 flex flex-wrap gap-2">
+        <button
+          type="button"
+          className={
+            tab === "central"
+              ? "btn-primary"
+              : "btn-secondary"
+          }
+          onClick={() => setTab("central")}
+        >
+          Central das rodadas
+        </button>
+        <button
+          type="button"
+          className={
+            tab === "avulsos"
+              ? "btn-primary"
+              : "btn-secondary"
+          }
+          onClick={() => setTab("avulsos")}
+        >
+          Pedidos avulsos
+        </button>
+      </div>
+
+      {tab === "central" ? (
+        <EncomendaCentralBoard />
+      ) : (
+        <>
       {error ? (
         <p className="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800">
           {error}
@@ -524,6 +556,8 @@ export default function EncomendasPage() {
               );
             })}
         </div>
+      )}
+        </>
       )}
     </div>
   );

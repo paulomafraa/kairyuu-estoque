@@ -196,6 +196,9 @@ export type EventProductStock = {
   notes: string;
   updated_at: string;
   updated_by: string | null;
+  pedido_feito?: boolean;
+  pedido_feito_at?: string | null;
+  pedido_feito_by?: string | null;
 };
 
 export type EventAllocation = {
