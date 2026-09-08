@@ -7,7 +7,10 @@ import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
 import { createClient } from "@/lib/supabase/client";
 import { EVENT_STATUS_LABEL } from "@/lib/labels";
-import { paymentUrgency } from "@/lib/leilao-resultado";
+import {
+  isActiveBillableSaleLine,
+  paymentUrgency,
+} from "@/lib/leilao-resultado";
 import type { Event, EventStatus, Profile } from "@/lib/types";
 
 function statusTone(status: EventStatus) {
@@ -42,7 +45,9 @@ export default function EventosPage() {
         supabase.from("profiles").select("*").order("name"),
         supabase
           .from("event_sale_lines")
-          .select("event_id, paid, cancelled"),
+          .select(
+            "event_id, paid, cancelled, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
+          ),
         supabase.auth.getUser(),
       ]);
     if (e1) setError(e1.message);
@@ -50,12 +55,15 @@ export default function EventosPage() {
 
     const unpaidByEvent = new Map<string, number>();
     const list = (ev as EventRow[]) || [];
+    const kindById = new Map(list.map((e) => [e.id, e.kind || "leilao"]));
     for (const evRow of list) {
       unpaidByEvent.set(evRow.id, 0);
     }
     for (const line of lines || []) {
-      if (line.cancelled || line.paid) continue;
       const id = line.event_id as string;
+      const kind = kindById.get(id);
+      if (!isActiveBillableSaleLine(line, kind)) continue;
+      if (line.paid) continue;
       const evRow = list.find((e) => e.id === id);
       const u = paymentUrgency(false, false, evRow?.payment_due_at);
       if (u === "warn" || u === "overdue") {
@@ -190,7 +198,7 @@ export default function EventosPage() {
                     {ev.name}
                     {ev.unpaidUrgent ? (
                       <span className="ml-2 text-xs font-semibold text-red-700">
-                        {ev.unpaidUrgent} cobrança(s) urgente(s)
+                        {ev.unpaidUrgent} pagamento(s) em aberto no prazo
                       </span>
                     ) : null}
                   </td>

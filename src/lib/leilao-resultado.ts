@@ -56,8 +56,8 @@ export function isEncInterestOption(name: string): boolean {
 export function isShelvedSaleLine(
   line: {
     archived?: boolean | null;
-    import_status?: string;
-    valor_ou_opcao?: string;
+    import_status?: string | null;
+    valor_ou_opcao?: string | null;
   },
   kind?: string | null,
 ): boolean {
@@ -191,6 +191,31 @@ export function classifyStoredLeilaoLine(line: {
   return "certain";
 }
 
+/**
+ * Linha que entra em cobrança/prazo (mesma regra dos Participantes do evento).
+ * Ignora cancelados, arquivados, 💙 e (no leilão) revisão ❓ / sem votos.
+ */
+export function isActiveBillableSaleLine(
+  line: {
+    cancelled?: boolean | null;
+    archived?: boolean | null;
+    import_status?: string;
+    certainty?: string;
+    phone_digits?: string | null;
+    valor_ou_opcao?: string | null;
+    notes?: string | null;
+  },
+  kind?: string | null,
+): boolean {
+  if (line.cancelled) return false;
+  if (isShelvedSaleLine(line, kind)) return false;
+  if (kind === "leilao") {
+    const bucket = classifyStoredLeilaoLine(line);
+    if (bucket === "review" || bucket === "no_votes") return false;
+  }
+  return true;
+}
+
 export function resultadoToSaleLine(row: ResultadoRow): ParsedSaleLine | null {
   const title = (row.carta || "").trim();
   if (!title) return null;
@@ -223,6 +248,35 @@ export function resultadoToSaleLine(row: ResultadoRow): ParsedSaleLine | null {
     poll_id: (row.poll_id || "").trim(),
     qty: 1,
   };
+}
+
+/**
+ * Chave pra não duplicar na reimportação.
+ * - leilão: 1 dono por enquete (poll + título)
+ * - encomenda: vários clientes na mesma carta → inclui telefone/nome
+ */
+export function saleLineImportDedupeKey(
+  line: {
+    poll_id?: string | null;
+    product_title: string;
+    phone_digits?: string | null;
+    customer_name_snapshot?: string | null;
+    import_status?: string | null;
+  },
+  kind: "leilao" | "encomenda" | "outro" | string | undefined,
+): string {
+  const title = (line.product_title || "").toLowerCase().trim();
+  const poll = (line.poll_id || "").toLowerCase().trim();
+  if (kind === "encomenda") {
+    const who =
+      (line.phone_digits || "").trim() ||
+      (line.customer_name_snapshot || "").toLowerCase().trim() ||
+      "?";
+    return `${poll}|${title}|${who}`;
+  }
+  if (poll) return `${poll}|${title}`;
+  const st = (line.import_status || "").toLowerCase().trim();
+  return `${title}|${st}`;
 }
 
 /**

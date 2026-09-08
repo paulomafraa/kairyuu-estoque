@@ -21,6 +21,7 @@ import {
   isEncInterestOption,
   parseMoneyFromOption,
   classifyStoredLeilaoLine,
+  isActiveBillableSaleLine,
   saleLineImportDedupeKey,
   type ParsedSaleLine,
 } from "@/lib/leilao-resultado";
@@ -348,13 +349,13 @@ export default function EventoDetailPage() {
         byKey.set(key, p);
       }
       p.lines.push(line);
-      if (!isShelvedSaleLine(line, kind) && !line.paid) p.unpaid += 1;
+      if (isActiveBillableSaleLine(line, kind) && !line.paid) p.unpaid += 1;
     }
 
     const due = event?.payment_due_at;
     const list = [...byKey.values()]
       .map((p) => {
-        const active = p.lines.filter((l) => !isShelvedSaleLine(l, kind));
+        const active = p.lines.filter((l) => isActiveBillableSaleLine(l, kind));
         const anyUnpaid = active.some((l) => !l.paid && !l.cancelled);
         return {
           ...p,
@@ -363,7 +364,7 @@ export default function EventoDetailPage() {
             : ("ok" as const),
         };
       })
-      .filter((p) => p.lines.some((l) => !isShelvedSaleLine(l, kind)));
+      .filter((p) => p.lines.some((l) => isActiveBillableSaleLine(l, kind)));
     list.sort((a, b) => {
       const rank = { overdue: 0, warn: 1, none: 2, ok: 3 };
       return rank[a.urgency] - rank[b.urgency] || a.name.localeCompare(b.name, "pt-BR");
@@ -925,12 +926,21 @@ export default function EventoDetailPage() {
   ) {
     if (!ids.length) return;
     setError(null);
-    const { error: err } = await supabase
+    const { data, error: err } = await supabase
       .from("event_sale_lines")
       .update(patch)
-      .in("id", ids);
+      .in("id", ids)
+      .select("id");
     if (err) {
       setError(err.message);
+      return;
+    }
+    const updated = data?.length ?? 0;
+    if (updated !== ids.length) {
+      setError(
+        `Atualização incompleta: ${updated} de ${ids.length} item(ns). Recarregue a página e confira o estado.`,
+      );
+      await load();
       return;
     }
     setInfo(`${label} · ${ids.length} item(ns) · ${meName}`);

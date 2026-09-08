@@ -8,7 +8,10 @@ import { Badge } from "@/components/Badge";
 import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
-import { paymentUrgency } from "@/lib/leilao-resultado";
+import {
+  isActiveBillableSaleLine,
+  paymentUrgency,
+} from "@/lib/leilao-resultado";
 import type { Customer } from "@/lib/types";
 
 type Filter = "ativos" | "sem_pedidos" | "pendencias" | "todos";
@@ -50,8 +53,10 @@ export default function ClientesPage() {
       supabase.from("orders").select("customer_id"),
       supabase
         .from("event_sale_lines")
-        .select("customer_id, paid, cancelled, charged, separated, event_id"),
-      supabase.from("events").select("id, payment_due_at, name"),
+        .select(
+          "customer_id, paid, cancelled, charged, separated, event_id, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
+        ),
+      supabase.from("events").select("id, payment_due_at, name, kind"),
       supabase
         .from("customer_garage_items")
         .select("customer_id, status, qty_with_store, qty_sent"),
@@ -62,8 +67,10 @@ export default function ClientesPage() {
     }
 
     const dueByEvent = new Map<string, string | null>();
+    const kindByEvent = new Map<string, string | null>();
     for (const ev of events || []) {
       dueByEvent.set(ev.id as string, (ev.payment_due_at as string) || null);
+      kindByEvent.set(ev.id as string, (ev.kind as string) || "leilao");
     }
 
     const activeIds = new Set<string>();
@@ -83,7 +90,9 @@ export default function ClientesPage() {
     };
 
     for (const line of saleLines || []) {
-      if (!line.customer_id || line.cancelled || line.paid) continue;
+      if (!line.customer_id || line.paid) continue;
+      const kind = kindByEvent.get(line.event_id as string);
+      if (!isActiveBillableSaleLine(line, kind)) continue;
       const due = dueByEvent.get(line.event_id as string);
       const u = paymentUrgency(false, false, due);
       if (u === "overdue") bump(line.customer_id as string, "pagamento atrasado");
