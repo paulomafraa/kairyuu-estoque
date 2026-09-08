@@ -23,6 +23,9 @@ import {
   formatMoneyBr,
   greetingName,
   leilaoGarageUrgency,
+  formatLeilaoGarageDeadline,
+  LEILAO_GARAGE_LIMIT_DAYS,
+  LEILAO_GARAGE_WARN_DAYS,
 } from "@/lib/cobranca-msg";
 import {
   isShelvedSaleLine,
@@ -1050,6 +1053,33 @@ export default function ClienteDetailPage() {
             {item.shipped_on ? (
               <Badge tone="info">Envio {fmtDay(item.shipped_on)}</Badge>
             ) : null}
+            {item.origin === "leilao" &&
+            Number(item.qty_with_store) > 0 &&
+            item.status !== "cancelled"
+              ? (() => {
+                  const daysHeld = daysSincePayment(item.created_at);
+                  if (daysHeld == null) return null;
+                  const deadline = formatLeilaoGarageDeadline({
+                    daysHeld,
+                    sinceIso: item.created_at,
+                  });
+                  if (deadline.urgency === "ok" || deadline.urgency === "none") {
+                    return (
+                      <Badge tone="neutral" title={deadline.detailLabel}>
+                        Leilão desde {deadline.sinceLabel} · {daysHeld}d
+                      </Badge>
+                    );
+                  }
+                  return (
+                    <Badge
+                      tone={deadline.urgency === "overdue" ? "bad" : "warn"}
+                      title={deadline.detailLabel}
+                    >
+                      {deadline.shortLabel}
+                    </Badge>
+                  );
+                })()
+              : null}
           </div>
           {item.notes ? (
             <p className="mt-1 text-xs text-zinc-500">{item.notes}</p>
@@ -1349,33 +1379,52 @@ export default function ClienteDetailPage() {
         ) : null}
 
         {leilaoGarageAlerts.length > 0 ? (
-          <div className="rounded-md border border-amber-300 bg-amber-50/70 px-3 py-3">
-            <h3 className="text-sm font-semibold text-amber-950">
-              Leilão na caixinha · prazo de 2 meses ({leilaoGarageAlerts.length})
+          <div
+            className={`rounded-md border px-3 py-3 ${
+              leilaoGarageAlerts.some((a) => a.urgency === "overdue")
+                ? "border-red-300 bg-red-50/70"
+                : "border-amber-300 bg-amber-50/70"
+            }`}
+          >
+            <h3 className="text-sm font-semibold text-zinc-900">
+              Aviso · leilão na caixinha (prazo de 2 meses)
             </h3>
-            <p className="mt-1 text-xs text-amber-900/80">
-              Conta a partir do pagamento. Amarelo ≈ 50 dias; vermelho ≥ 60.
+            <p className="mt-1 text-xs text-zinc-600">
+              Cartas de leilão ficam conosco por até {LEILAO_GARAGE_LIMIT_DAYS}{" "}
+              dias a partir do pagamento. Amarelo a partir de{" "}
+              {LEILAO_GARAGE_WARN_DAYS} dias.
             </p>
-            <ul className="mt-2 space-y-1 text-sm">
-              {leilaoGarageAlerts.map(({ item, daysHeld, urgency }) => (
-                <li
-                  key={item.id}
-                  className="flex flex-wrap items-center justify-between gap-2"
-                >
-                  <span>
-                    {item.title}
-                    {item.event_name ? (
-                      <span className="text-xs text-zinc-600">
-                        {" "}
-                        · {item.event_name}
-                      </span>
-                    ) : null}
-                  </span>
-                  <Badge tone={urgency === "overdue" ? "bad" : "warn"}>
-                    {daysHeld}d na loja
-                  </Badge>
-                </li>
-              ))}
+            <ul className="mt-2 space-y-2 text-sm">
+              {leilaoGarageAlerts.map(({ item, daysHeld, urgency }) => {
+                const deadline = formatLeilaoGarageDeadline({
+                  daysHeld,
+                  sinceIso: item.created_at,
+                });
+                return (
+                  <li
+                    key={item.id}
+                    className="flex flex-wrap items-start justify-between gap-2 rounded-md border border-white/70 bg-white/80 px-2 py-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-medium text-zinc-900">
+                        {item.title}
+                        {item.event_name ? (
+                          <span className="text-xs font-normal text-zinc-600">
+                            {" "}
+                            · {item.event_name}
+                          </span>
+                        ) : null}
+                      </div>
+                      <p className="mt-0.5 text-xs text-zinc-600">
+                        {deadline.detailLabel}
+                      </p>
+                    </div>
+                    <Badge tone={urgency === "overdue" ? "bad" : "warn"}>
+                      {deadline.shortLabel}
+                    </Badge>
+                  </li>
+                );
+              })}
             </ul>
             <button
               type="button"

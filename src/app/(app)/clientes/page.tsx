@@ -9,18 +9,30 @@ import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  daysSincePayment,
+  formatLeilaoGarageDeadline,
+  leilaoGarageUrgency,
+} from "@/lib/cobranca-msg";
+import {
   isActiveBillableSaleLine,
   paymentUrgency,
 } from "@/lib/leilao-resultado";
 import type { Customer } from "@/lib/types";
 
-type Filter = "ativos" | "sem_pedidos" | "pendencias" | "todos";
+type Filter = "ativos" | "sem_pedidos" | "pendencias" | "todos" | "prazo_leilao";
 
 type CustomerRow = Customer & {
   hasOrders: boolean;
   pendencias: number;
   pendenciaLabel: string;
   caixinhaCount: number;
+  leilaoGarage?: {
+    count: number;
+    worst: "ok" | "warn" | "overdue";
+    oldestDays: number;
+    sinceIso: string;
+    shortLabel: string;
+  } | null;
 };
 
 export default function ClientesPage() {
@@ -59,7 +71,9 @@ export default function ClientesPage() {
       supabase.from("events").select("id, payment_due_at, name, kind"),
       supabase
         .from("customer_garage_items")
-        .select("customer_id, status, qty_with_store, qty_sent"),
+        .select(
+          "customer_id, status, qty_with_store, qty_sent, origin, created_at, title",
+        ),
     ]);
     if (e1) {
       setError(e1.message);
@@ -102,6 +116,15 @@ export default function ClientesPage() {
     }
 
     const garageByCustomer = new Map<string, number>();
+    type LeilaoAgg = {
+      count: number;
+      worst: "ok" | "warn" | "overdue";
+      oldestDays: number;
+      sinceIso: string;
+    };
+    const leilaoByCustomer = new Map<string, LeilaoAgg>();
+    const worstRank = { overdue: 0, warn: 1, ok: 2 } as const;
+
     for (const g of garage || []) {
       if (g.status === "cancelled") continue;
       if ((g.qty_with_store as number) > 0) {
@@ -115,17 +138,64 @@ export default function ClientesPage() {
       if ((g.qty_sent as number) > 0) {
         bump(g.customer_id as string, "envio a confirmar/entregar");
       }
+      if (
+        g.origin === "leilao" &&
+        (g.qty_with_store as number) > 0
+      ) {
+        const daysHeld = daysSincePayment(g.created_at as string);
+        if (daysHeld == null) continue;
+        const urgency = leilaoGarageUrgency(daysHeld);
+        const id = g.customer_id as string;
+        const prev = leilaoByCustomer.get(id);
+        if (!prev) {
+          leilaoByCustomer.set(id, {
+            count: 1,
+            worst: urgency === "none" ? "ok" : urgency,
+            oldestDays: daysHeld,
+            sinceIso: g.created_at as string,
+          });
+        } else {
+          prev.count += 1;
+          if (daysHeld > prev.oldestDays) {
+            prev.oldestDays = daysHeld;
+            prev.sinceIso = g.created_at as string;
+          }
+          const next = urgency === "none" ? "ok" : urgency;
+          if (worstRank[next] < worstRank[prev.worst]) prev.worst = next;
+        }
+        if (urgency === "overdue") {
+          bump(id, "leilão: prazo 2 meses estourado");
+        } else if (urgency === "warn") {
+          bump(id, "leilão: perto do prazo de envio");
+        }
+      }
     }
 
     setCustomers(
       ((cu as Customer[]) || []).map((c) => {
         const pend = pendByCustomer.get(c.id);
+        const leilao = leilaoByCustomer.get(c.id);
+        const deadline = leilao
+          ? formatLeilaoGarageDeadline({
+              daysHeld: leilao.oldestDays,
+              sinceIso: leilao.sinceIso,
+            })
+          : null;
         return {
           ...c,
           hasOrders: activeIds.has(c.id),
           pendencias: pend?.n || 0,
           pendenciaLabel: pend?.hints.join(" · ") || "",
           caixinhaCount: garageByCustomer.get(c.id) || 0,
+          leilaoGarage: leilao
+            ? {
+                count: leilao.count,
+                worst: leilao.worst,
+                oldestDays: leilao.oldestDays,
+                sinceIso: leilao.sinceIso,
+                shortLabel: deadline?.shortLabel || "",
+              }
+            : null,
         };
       }),
     );
@@ -290,6 +360,15 @@ export default function ClientesPage() {
     if (filter === "ativos" && !c.hasOrders) return false;
     if (filter === "sem_pedidos" && c.hasOrders) return false;
     if (filter === "pendencias" && c.pendencias <= 0) return false;
+    if (
+      filter === "prazo_leilao" &&
+      !(
+        c.leilaoGarage &&
+        (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue")
+      )
+    ) {
+      return false;
+    }
     const hay = `${c.name} ${c.phone}`.toLowerCase();
     return hay.includes(q.toLowerCase());
   });
@@ -299,6 +378,11 @@ export default function ClientesPage() {
     ativos: customers.filter((c) => c.hasOrders).length,
     sem_pedidos: customers.filter((c) => !c.hasOrders).length,
     pendencias: customers.filter((c) => c.pendencias > 0).length,
+    prazo_leilao: customers.filter(
+      (c) =>
+        c.leilaoGarage &&
+        (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue"),
+    ).length,
   };
 
   return (
@@ -443,6 +527,10 @@ export default function ClientesPage() {
         {(
           [
             ["pendencias", `Pendências (${counts.pendencias})`],
+            [
+              "prazo_leilao",
+              `Leilão · prazo 2 meses (${counts.prazo_leilao})`,
+            ],
             ["ativos", `Ativos (${counts.ativos})`],
             ["sem_pedidos", `Sem pedidos (${counts.sem_pedidos})`],
             ["todos", `Todos (${counts.todos})`],
@@ -500,6 +588,22 @@ export default function ClientesPage() {
                     <div className="flex flex-wrap gap-1">
                       {c.pendencias > 0 ? (
                         <Badge tone="bad">Pendência: {c.pendenciaLabel}</Badge>
+                      ) : null}
+                      {c.leilaoGarage &&
+                      (c.leilaoGarage.worst === "warn" ||
+                        c.leilaoGarage.worst === "overdue") ? (
+                        <Badge
+                          tone={
+                            c.leilaoGarage.worst === "overdue" ? "bad" : "warn"
+                          }
+                          title={c.leilaoGarage.shortLabel}
+                        >
+                          Leilão desde{" "}
+                          {new Date(c.leilaoGarage.sinceIso).toLocaleDateString(
+                            "pt-BR",
+                          )}{" "}
+                          · {c.leilaoGarage.shortLabel}
+                        </Badge>
                       ) : null}
                       {c.caixinhaCount > 0 ? (
                         <Badge tone="info">

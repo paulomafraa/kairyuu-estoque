@@ -256,12 +256,51 @@ export function daysSincePayment(
   return Math.round((a.getTime() - d.getTime()) / 86_400_000);
 }
 
+/** Limite de acumulação na loja para cartas de leilão (≈ 2 meses). */
+export const LEILAO_GARAGE_LIMIT_DAYS = 60;
+/** Aviso amarelo: faltam ~10 dias pro limite. */
+export const LEILAO_GARAGE_WARN_DAYS = 50;
+
 /** Alerta de prazo de garagem do leilão (2 meses ≈ 60 dias). */
 export function leilaoGarageUrgency(
   daysHeld: number | null,
 ): "ok" | "warn" | "overdue" | "none" {
   if (daysHeld == null) return "none";
-  if (daysHeld >= 60) return "overdue";
-  if (daysHeld >= 50) return "warn";
+  if (daysHeld >= LEILAO_GARAGE_LIMIT_DAYS) return "overdue";
+  if (daysHeld >= LEILAO_GARAGE_WARN_DAYS) return "warn";
   return "ok";
+}
+
+/** Texto curto do prazo de leilão na loja (desde o pagamento). */
+export function formatLeilaoGarageDeadline(opts: {
+  daysHeld: number;
+  sinceIso?: string | null;
+}): {
+  urgency: "ok" | "warn" | "overdue" | "none";
+  sinceLabel: string;
+  daysLeft: number;
+  shortLabel: string;
+  detailLabel: string;
+} {
+  const urgency = leilaoGarageUrgency(opts.daysHeld);
+  const sinceLabel = formatDiaCurto(opts.sinceIso);
+  const daysLeft = LEILAO_GARAGE_LIMIT_DAYS - opts.daysHeld;
+  let shortLabel = `${opts.daysHeld}d na loja`;
+  let detailLabel = `cartas de leilão conosco desde ${sinceLabel} · ${opts.daysHeld} dia(s)`;
+
+  if (urgency === "overdue") {
+    const late = Math.max(0, opts.daysHeld - LEILAO_GARAGE_LIMIT_DAYS);
+    shortLabel =
+      late > 0
+        ? `Prazo estourado · ${late}d além dos 2 meses`
+        : "Prazo de 2 meses estourado";
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Já passou o limite de 2 meses (${opts.daysHeld} dia(s) na loja) — pedir envio.`;
+  } else if (urgency === "warn") {
+    shortLabel = `Perto do prazo · faltam ${Math.max(0, daysLeft)}d`;
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 2 meses — avisar o cliente para pedir envio.`;
+  } else {
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel} · ${opts.daysHeld} dia(s) · faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 2 meses.`;
+  }
+
+  return { urgency, sinceLabel, daysLeft, shortLabel, detailLabel };
 }

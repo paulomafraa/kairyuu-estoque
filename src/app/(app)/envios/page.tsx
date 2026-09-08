@@ -9,7 +9,10 @@ import { createClient } from "@/lib/supabase/client";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
 import {
   daysSincePayment,
+  formatLeilaoGarageDeadline,
   leilaoGarageUrgency,
+  LEILAO_GARAGE_LIMIT_DAYS,
+  LEILAO_GARAGE_WARN_DAYS,
 } from "@/lib/cobranca-msg";
 import type { GarageItem, Event } from "@/lib/types";
 
@@ -284,9 +287,10 @@ export default function EnviosPage() {
                     Produtos a enviar · Leilão
                   </h2>
                   <p className="text-sm text-zinc-600">
-                    Só leilão · pagos ainda na loja · janela de ~2 meses. O prazo
-                    conta a partir da data do pagamento. Amarelo ≈ 50 dias; vermelho
-                    ≥ 60 dias.
+                    Cartas de leilão ficam conosco por até{" "}
+                    <strong>{LEILAO_GARAGE_LIMIT_DAYS} dias (~2 meses)</strong>{" "}
+                    a partir do pagamento. Amarelo a partir de{" "}
+                    {LEILAO_GARAGE_WARN_DAYS} dias; vermelho no limite.
                   </p>
                 </div>
                 <Badge tone={leilaoUrgentCount > 0 ? "bad" : "warn"}>
@@ -328,18 +332,29 @@ export default function EnviosPage() {
                       </div>
                     </div>
                     <ul className="space-y-2">
-                      {g.rows.map((item) => (
+                      {g.rows.map((item) => {
+                        const deadline = formatLeilaoGarageDeadline({
+                          daysHeld: item.daysHeld,
+                          sinceIso: item.created_at,
+                        });
+                        return (
                         <li
                           key={item.id}
-                          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-zinc-100 px-2 py-2 text-sm"
+                          className={`flex flex-wrap items-center justify-between gap-2 rounded-md border px-2 py-2 text-sm ${
+                            item.urgency === "overdue"
+                              ? "border-red-200 bg-red-50/60"
+                              : item.urgency === "warn"
+                                ? "border-amber-200 bg-amber-50/50"
+                                : "border-zinc-100 bg-white"
+                          }`}
                         >
-                          <div>
+                          <div className="min-w-0">
                             <div className="font-medium">{item.title}</div>
-                            <div className="text-xs text-zinc-500">
+                            <div className="text-xs text-zinc-600">
                               {item.customer_id ? (
                                 <Link
-                                  href={`/clientes/${item.customer_id}`}
-                                  className="underline decoration-zinc-300 underline-offset-2 hover:decoration-zinc-700"
+                                  href={`/clientes/${item.customer_id}?tab=garagem`}
+                                  className="font-medium underline decoration-zinc-300 underline-offset-2 hover:decoration-zinc-700"
                                 >
                                   {customerLabel(item)}
                                 </Link>
@@ -347,19 +362,28 @@ export default function EnviosPage() {
                                 customerLabel(item)
                               )}
                               {" · "}
-                              {item.qty_with_store} un. · há {item.daysHeld} dia(s)
-                              na loja (desde o pagamento)
+                              {item.qty_with_store} un.
+                            </div>
+                            <div className="mt-0.5 text-xs text-zinc-500">
+                              {item.urgency === "overdue"
+                                ? `Conosco desde ${deadline.sinceLabel} · passou o limite de 2 meses (${item.daysHeld}d)`
+                                : item.urgency === "warn"
+                                  ? `Conosco desde ${deadline.sinceLabel} · faltam ${Math.max(0, deadline.daysLeft)}d para o limite de 2 meses`
+                                  : `Conosco desde ${deadline.sinceLabel} · ${item.daysHeld}d · faltam ${Math.max(0, deadline.daysLeft)}d`}
                             </div>
                           </div>
                           {item.urgency === "overdue" ? (
-                            <Badge tone="bad">Enviar</Badge>
+                            <Badge tone="bad">{deadline.shortLabel}</Badge>
                           ) : item.urgency === "warn" ? (
-                            <Badge tone="warn">Atenção</Badge>
+                            <Badge tone="warn">{deadline.shortLabel}</Badge>
                           ) : (
-                            <Badge tone="info">{item.daysHeld}d</Badge>
+                            <Badge tone="info">
+                              desde {deadline.sinceLabel} · {item.daysHeld}d
+                            </Badge>
                           )}
                         </li>
-                      ))}
+                        );
+                      })}
                     </ul>
                   </div>
                 ))}
