@@ -9,6 +9,13 @@ import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  ensureCustomerByPhone,
+  fetchAllCustomers,
+  fetchAllQueryRows,
+  matchesCustomerQuery,
+} from "@/lib/customers";
+import { phoneInSet } from "@/lib/customer-activity";
+import {
   daysSincePayment,
   formatLeilaoGarageDeadline,
   leilaoGarageUrgency,
@@ -19,7 +26,23 @@ import {
 } from "@/lib/leilao-resultado";
 import type { Customer } from "@/lib/types";
 
-type Filter = "ativos" | "sem_pedidos" | "pendencias" | "todos" | "prazo_leilao";
+type Filter =
+  | "ativos"
+  | "sem_pedidos"
+  | "pendencias"
+  | "todos"
+  | "prazo_leilao"
+  | "inativos_grupo";
+
+type SilentGroupMember = {
+  phone_digits: string;
+  name: string;
+  message_count: number;
+  synced_at: string;
+};
+
+/** Limiar alinhado ao default do !inativos loja (≤5 msgs). */
+const INACTIVE_MSG_MAX = 5;
 
 type CustomerRow = Customer & {
   hasOrders: boolean;
@@ -38,6 +61,16 @@ type CustomerRow = Customer & {
 export default function ClientesPage() {
   const supabase = useMemo(() => createClient(), []);
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
+  const [silentGroupPhones, setSilentGroupPhones] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [lowActivityByPhone, setLowActivityByPhone] = useState<
+    Map<string, number>
+  >(() => new Map());
+  const [silentUnregistered, setSilentUnregistered] = useState<
+    SilentGroupMember[]
+  >([]);
+  const [groupSyncAt, setGroupSyncAt] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<Filter>("todos");
   const [name, setName] = useState("");
@@ -52,32 +85,92 @@ export default function ClientesPage() {
 
   const load = useCallback(async () => {
     setError(null);
+    let cu: Customer[] = [];
+    try {
+      cu = await fetchAllCustomers(supabase);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
     const [
-      { data: cu, error: e1 },
       { data: items },
       { data: orders },
-      { data: saleLines },
+      saleLines,
       { data: events },
       { data: garage },
+      { data: groupActivity, error: groupErr },
     ] = await Promise.all([
-      supabase.from("customers").select("*").order("name"),
       supabase.from("customer_items").select("customer_id"),
       supabase.from("orders").select("customer_id"),
-      supabase
-        .from("event_sale_lines")
-        .select(
-          "customer_id, paid, cancelled, charged, separated, event_id, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
-        ),
+      fetchAllQueryRows<{
+        customer_id: string | null;
+        paid: boolean;
+        cancelled: boolean;
+        charged: boolean;
+        separated: boolean;
+        event_id: string;
+        archived: boolean | null;
+        import_status?: string;
+        certainty?: string;
+        phone_digits: string | null;
+        valor_ou_opcao: string | null;
+        notes: string | null;
+      }>((from, to) =>
+        supabase
+          .from("event_sale_lines")
+          .select(
+            "id, customer_id, paid, cancelled, charged, separated, event_id, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
+          )
+          .order("id", { ascending: true })
+          .range(from, to),
+      ).catch((e) => {
+        console.error(e);
+        return [];
+      }),
       supabase.from("events").select("id, payment_due_at, name, kind"),
       supabase
         .from("customer_garage_items")
         .select(
           "customer_id, status, qty_with_store, qty_sent, origin, created_at, title",
         ),
+      supabase
+        .from("whatsapp_group_activity")
+        .select("phone_digits, name, message_count, present, synced_at")
+        .eq("group_alias", "loja")
+        .eq("present", true)
+        .lte("message_count", INACTIVE_MSG_MAX)
+        .order("message_count", { ascending: true }),
     ]);
-    if (e1) {
-      setError(e1.message);
-      return;
+
+    let lowActivityRows: SilentGroupMember[] = [];
+    if (groupErr) {
+      // migration ainda não rodada — filtro inativos fica vazio
+      console.warn("whatsapp_group_activity:", groupErr.message);
+      setSilentGroupPhones(new Set());
+      setLowActivityByPhone(new Map());
+      setSilentUnregistered([]);
+      setGroupSyncAt(null);
+    } else {
+      lowActivityRows = (groupActivity || []) as SilentGroupMember[];
+      const phones = new Set(
+        lowActivityRows
+          .map((r) => normalizePhoneDigits(r.phone_digits))
+          .filter(Boolean),
+      );
+      setSilentGroupPhones(phones);
+      const msgMap = new Map<string, number>();
+      for (const r of lowActivityRows) {
+        const d = normalizePhoneDigits(r.phone_digits);
+        if (d) msgMap.set(d, r.message_count);
+      }
+      setLowActivityByPhone(msgMap);
+      let latest: string | null = null;
+      for (const r of lowActivityRows) {
+        if (!latest || (r.synced_at && r.synced_at > latest)) {
+          latest = r.synced_at;
+        }
+      }
+      setGroupSyncAt(latest);
     }
 
     const dueByEvent = new Map<string, string | null>();
@@ -171,34 +264,44 @@ export default function ClientesPage() {
       }
     }
 
-    setCustomers(
-      ((cu as Customer[]) || []).map((c) => {
-        const pend = pendByCustomer.get(c.id);
-        const leilao = leilaoByCustomer.get(c.id);
-        const deadline = leilao
-          ? formatLeilaoGarageDeadline({
-              daysHeld: leilao.oldestDays,
+    const mapped = cu.map((c) => {
+      const pend = pendByCustomer.get(c.id);
+      const leilao = leilaoByCustomer.get(c.id);
+      const deadline = leilao
+        ? formatLeilaoGarageDeadline({
+            daysHeld: leilao.oldestDays,
+            sinceIso: leilao.sinceIso,
+          })
+        : null;
+      return {
+        ...c,
+        hasOrders: activeIds.has(c.id),
+        pendencias: pend?.n || 0,
+        pendenciaLabel: pend?.hints.join(" · ") || "",
+        caixinhaCount: garageByCustomer.get(c.id) || 0,
+        leilaoGarage: leilao
+          ? {
+              count: leilao.count,
+              worst: leilao.worst,
+              oldestDays: leilao.oldestDays,
               sinceIso: leilao.sinceIso,
-            })
-          : null;
-        return {
-          ...c,
-          hasOrders: activeIds.has(c.id),
-          pendencias: pend?.n || 0,
-          pendenciaLabel: pend?.hints.join(" · ") || "",
-          caixinhaCount: garageByCustomer.get(c.id) || 0,
-          leilaoGarage: leilao
-            ? {
-                count: leilao.count,
-                worst: leilao.worst,
-                oldestDays: leilao.oldestDays,
-                sinceIso: leilao.sinceIso,
-                shortLabel: deadline?.shortLabel || "",
-              }
-            : null,
-        };
-      }),
-    );
+              shortLabel: deadline?.shortLabel || "",
+            }
+          : null,
+      };
+    });
+    setCustomers(mapped);
+
+    if (!groupErr && lowActivityRows.length) {
+      const customerPhones = mapped.map(
+        (c) => c.phone_digits || normalizePhoneDigits(c.phone || ""),
+      );
+      setSilentUnregistered(
+        lowActivityRows.filter(
+          (r) => !phoneInSet(r.phone_digits, customerPhones),
+        ),
+      );
+    }
   }, [supabase]);
 
   useEffect(() => {
@@ -209,24 +312,35 @@ export default function ClientesPage() {
     e.preventDefault();
     setError(null);
     const digits = normalizePhoneDigits(phone);
-    const { data, error: err } = await supabase
-      .from("customers")
-      .insert({
-        name: name.trim(),
-        phone: digits || phone.trim(),
-        phone_digits: digits || null,
-        source: "manual",
-        notes: "",
-      })
-      .select("id")
-      .single();
-    if (err) {
-      setError(err.message);
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Informe o nome do cliente.");
       return;
     }
-    setName("");
-    setPhone("");
-    window.location.href = `/clientes/${data.id}`;
+    if (!digits || digits.length < 10 || digits.length > 15) {
+      setError(
+        "Informe o WhatsApp com DDD (10–15 dígitos). Sem telefone o cliente some das buscas de associação.",
+      );
+      return;
+    }
+    try {
+      const { customer, created, renamed } = await ensureCustomerByPhone(
+        supabase,
+        { name: trimmedName, phoneDigits: digits },
+      );
+      if (!created && !renamed) {
+        setInfo(
+          `Esse WhatsApp já existia como “${customer.name}”. Abrindo a ficha.`,
+        );
+      } else if (renamed) {
+        setInfo(`Cadastro atualizado para “${customer.name}”.`);
+      }
+      setName("");
+      setPhone("");
+      window.location.href = `/clientes/${customer.id}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function onImport(e: FormEvent) {
@@ -356,7 +470,8 @@ export default function ClientesPage() {
     }
   }
 
-  const filtered = customers.filter((c) => {
+  const filtered = customers
+    .filter((c) => {
     if (filter === "ativos" && !c.hasOrders) return false;
     if (filter === "sem_pedidos" && c.hasOrders) return false;
     if (filter === "pendencias" && c.pendencias <= 0) return false;
@@ -369,9 +484,29 @@ export default function ClientesPage() {
     ) {
       return false;
     }
-    const hay = `${c.name} ${c.phone}`.toLowerCase();
-    return hay.includes(q.toLowerCase());
-  });
+    if (filter === "inativos_grupo") {
+      const phone = c.phone_digits || normalizePhoneDigits(c.phone || "");
+      if (!phoneInSet(phone, silentGroupPhones)) return false;
+    }
+    return matchesCustomerQuery(c, q);
+  })
+    .sort((a, b) => {
+      if (filter !== "inativos_grupo") return 0;
+      const pa = normalizePhoneDigits(a.phone_digits || a.phone || "");
+      const pb = normalizePhoneDigits(b.phone_digits || b.phone || "");
+      const ma = lowActivityByPhone.get(pa) ?? 9999;
+      const mb = lowActivityByPhone.get(pb) ?? 9999;
+      return ma - mb || a.name.localeCompare(b.name, "pt-BR");
+    });
+
+  const inactiveUnregisteredFiltered = [...silentUnregistered]
+    .sort((a, b) => a.message_count - b.message_count)
+    .filter((r) =>
+      matchesCustomerQuery(
+        { name: r.name, phone: r.phone_digits, phone_digits: r.phone_digits },
+        q,
+      ),
+    );
 
   const counts = {
     todos: customers.length,
@@ -383,6 +518,11 @@ export default function ClientesPage() {
         c.leilaoGarage &&
         (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue"),
     ).length,
+    inativos_grupo:
+      customers.filter((c) => {
+        const phone = c.phone_digits || normalizePhoneDigits(c.phone || "");
+        return phoneInSet(phone, silentGroupPhones);
+      }).length + silentUnregistered.length,
   };
 
   return (
@@ -509,7 +649,9 @@ export default function ClientesPage() {
           />
         </label>
         <label className="text-sm">
-          <span className="mb-1 block text-zinc-600">Telefone / WhatsApp</span>
+          <span className="mb-1 block text-zinc-600">
+            Telefone / WhatsApp (obrigatório)
+          </span>
           <input
             className="field"
             value={phone}
@@ -531,6 +673,10 @@ export default function ClientesPage() {
               "prazo_leilao",
               `Leilão · prazo 2 meses (${counts.prazo_leilao})`,
             ],
+            [
+              "inativos_grupo",
+              `Inativos do grupo (${counts.inativos_grupo})`,
+            ],
             ["ativos", `Ativos (${counts.ativos})`],
             ["sem_pedidos", `Sem pedidos (${counts.sem_pedidos})`],
             ["todos", `Todos (${counts.todos})`],
@@ -547,6 +693,17 @@ export default function ClientesPage() {
         ))}
       </div>
 
+      {filter === "inativos_grupo" ? (
+        <p className="mb-3 text-sm text-zinc-600">
+          Baixa atividade no grupo (≤{INACTIVE_MSG_MAX} msgs no sync do bot), do
+          menos ativo ao mais ativo. Cadastro no estoque aparece como ficha, mas
+          não tira da lista.
+          {groupSyncAt
+            ? ` Último sync: ${new Date(groupSyncAt).toLocaleString("pt-BR")}.`
+            : " Ainda sem sync — rode !inativos loja na auditoria."}
+        </p>
+      ) : null}
+
       <input
         className="field mb-3 max-w-md"
         placeholder="Buscar cliente..."
@@ -554,12 +711,17 @@ export default function ClientesPage() {
         onChange={(e) => setQ(e.target.value)}
       />
 
-      {filtered.length === 0 ? (
+      {filtered.length === 0 &&
+      !(filter === "inativos_grupo" && inactiveUnregisteredFiltered.length) ? (
         <EmptyState
           title="Nenhum cliente neste filtro"
-          hint="Importe o CSV do grupo ou cadastre manualmente."
+          hint={
+            filter === "inativos_grupo"
+              ? "Rode !inativos loja na auditoria do WhatsApp para sincronizar."
+              : "Importe o CSV do grupo ou cadastre manualmente."
+          }
         />
-      ) : (
+      ) : filtered.length > 0 ? (
         <div className="table-wrap">
           <table className="data">
             <thead>
@@ -586,6 +748,18 @@ export default function ClientesPage() {
                   <td>{c.phone || "—"}</td>
                   <td>
                     <div className="flex flex-wrap gap-1">
+                      {filter === "inativos_grupo" ? (
+                        <Badge tone="warn">
+                          {(
+                            lowActivityByPhone.get(
+                              normalizePhoneDigits(
+                                c.phone_digits || c.phone || "",
+                              ),
+                            ) ?? "?"
+                          ).toString()}{" "}
+                          msgs
+                        </Badge>
+                      ) : null}
                       {c.pendencias > 0 ? (
                         <Badge tone="bad">Pendência: {c.pendenciaLabel}</Badge>
                       ) : null}
@@ -638,7 +812,35 @@ export default function ClientesPage() {
             </tbody>
           </table>
         </div>
-      )}
+      ) : null}
+
+      {filter === "inativos_grupo" &&
+      inactiveUnregisteredFiltered.length > 0 ? (
+        <div className="panel mt-4">
+          <h2 className="mb-1 text-base font-semibold text-zinc-900">
+            Sem ficha no estoque ({inactiveUnregisteredFiltered.length})
+          </h2>
+          <p className="mb-3 text-sm text-zinc-600">
+            Baixa atividade e ainda sem cadastro de cliente.
+          </p>
+          <ul className="max-h-64 space-y-1 overflow-y-auto text-sm">
+            {inactiveUnregisteredFiltered.map((r) => (
+              <li
+                key={r.phone_digits}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-50"
+              >
+                <span className="font-medium">
+                  {r.name || r.phone_digits}{" "}
+                  <span className="font-normal text-zinc-500">
+                    · {r.message_count} msg
+                  </span>
+                </span>
+                <span className="text-zinc-500">{r.phone_digits}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -16,6 +16,12 @@ import { createClient } from "@/lib/supabase/client";
 import { logStaffAction } from "@/lib/audit";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  fetchCustomersSharingPhone,
+  fetchSaleLinesForCustomer,
+  pickCanonicalCustomerId,
+  relinkSaleLinesToCanonicalCustomer,
+} from "@/lib/customers";
+import {
   buildBillingMessage,
   buildCombinedBillingMessage,
   daysSincePayment,
@@ -27,6 +33,7 @@ import {
   LEILAO_GARAGE_LIMIT_DAYS,
   LEILAO_GARAGE_WARN_DAYS,
 } from "@/lib/cobranca-msg";
+import { eventHappenedOn } from "@/lib/event-date";
 import {
   isShelvedSaleLine,
   parseMoneyFromOption,
@@ -175,12 +182,47 @@ export default function ClienteDetailPage() {
       setMeName(profile?.name || auth.data.user?.email || "Staff");
     }
 
-    const [cu, gi, nt, ph, profiles, ev, sh] = await Promise.all([
-      supabase.from("customers").select("*").eq("id", customerId).single(),
+    const cu = await supabase
+      .from("customers")
+      .select("*")
+      .eq("id", customerId)
+      .single();
+
+    if (cu.error) {
+      setError(cu.error.message);
+      return;
+    }
+
+    const current = cu.data as Customer;
+    setCustomer(current);
+    setEditName(current.name);
+
+    const phoneDigits =
+      current.phone_digits || normalizePhoneDigits(current.phone || "");
+
+    let relatedIds = [customerId];
+    try {
+      const sharing = await fetchCustomersSharingPhone(
+        supabase,
+        customerId,
+        phoneDigits,
+      );
+      relatedIds = [...new Set([customerId, ...sharing.map((c) => c.id)])];
+      const canonicalId = pickCanonicalCustomerId(sharing, customerId);
+      await relinkSaleLinesToCanonicalCustomer(supabase, {
+        canonicalId,
+        relatedIds,
+        phoneDigits,
+      });
+    } catch (e) {
+      console.warn("Não foi possível unificar duplicatas do cliente:", e);
+    }
+
+    const [gi, nt, ph, profiles, ev, sh, saleLines] = await Promise.all([
       supabase
         .from("customer_garage_items")
         .select("*")
-        .eq("customer_id", customerId)
+        .in("customer_id", relatedIds)
         .order("created_at", { ascending: false }),
       supabase
         .from("customer_notes")
@@ -196,43 +238,28 @@ export default function ClienteDetailPage() {
       supabase
         .from("customer_garage_events")
         .select("*")
-        .eq("customer_id", customerId)
+        .in("customer_id", relatedIds)
         .order("created_at", { ascending: false })
         .limit(200),
       supabase
         .from("customer_shipments")
         .select("*")
-        .eq("customer_id", customerId)
+        .in("customer_id", relatedIds)
         .order("shipped_on", { ascending: false }),
+      fetchSaleLinesForCustomer<ChargeLine>(supabase, {
+        customerIds: relatedIds,
+        phoneDigits,
+        select:
+          "*, events(id, name, opened_at, payment_due_at, kind, status)",
+        cancelled: false,
+      }).catch((e) => {
+        console.error(e);
+        setError(e instanceof Error ? e.message : String(e));
+        return [] as ChargeLine[];
+      }),
     ]);
 
-    if (cu.error) setError(cu.error.message);
-    else {
-      setCustomer(cu.data as Customer);
-      setEditName((cu.data as Customer).name);
-    }
-
-    const phoneDigits =
-      (cu.data as Customer | null)?.phone_digits ||
-      normalizePhoneDigits((cu.data as Customer | null)?.phone || "");
-
-    const saleQuery = supabase
-      .from("event_sale_lines")
-      .select(
-        "*, events(id, name, opened_at, payment_due_at, kind, status)",
-      )
-      .eq("cancelled", false)
-      .order("created_at", { ascending: false })
-      .limit(400);
-
-    const saleRes = phoneDigits
-      ? await saleQuery.or(
-          `customer_id.eq.${customerId},phone_digits.eq.${phoneDigits}`,
-        )
-      : await saleQuery.eq("customer_id", customerId);
-
-    if (saleRes.error) setChargeLines([]);
-    else setChargeLines((saleRes.data as ChargeLine[]) || []);
+    setChargeLines(saleLines);
 
     const nameById = new Map<string, string>();
     for (const p of profiles.data || []) {
@@ -384,8 +411,22 @@ export default function ClienteDetailPage() {
     kind: "send" | "deliver" | "unsend",
     opts?: { shipmentId?: string | null; shippedOn?: string | null },
   ) {
+    if (busy) return;
     const n = Math.max(1, amount);
+    setBusy(true);
     setError(null);
+    try {
+    // Relê qty atual no banco para evitar clique duplo / corrida com o evento
+    const { data: fresh } = await supabase
+      .from("customer_garage_items")
+      .select("*")
+      .eq("id", item.id)
+      .maybeSingle();
+    if (!fresh) {
+      setError("Item não encontrado na caixinha.");
+      return;
+    }
+    item = fresh as GarageItem;
     let next = { ...item };
     let shipmentId = item.shipment_id ?? null;
     let shippedOn = item.shipped_on ?? null;
@@ -484,6 +525,9 @@ export default function ClienteDetailPage() {
       return copy;
     });
     await load();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function ensureShipment(shippedOn: string, label = "") {
@@ -664,6 +708,17 @@ export default function ClienteDetailPage() {
       setError(err.message);
       return;
     }
+    // Mantém evento alinhado: cancela linhas ligadas a este item da caixinha
+    await supabase
+      .from("event_sale_lines")
+      .update({
+        cancelled: true,
+        cancel_reason: reason.trim() || "Estorno / cancelamento na ficha",
+        cancelled_at: new Date().toISOString(),
+        cancelled_by: meId,
+      })
+      .eq("garage_item_id", item.id)
+      .eq("cancelled", false);
     await logEvent(
       "cancel",
       `${item.title} cancelado/estornado · por ${meName}` +
@@ -764,8 +819,10 @@ export default function ClienteDetailPage() {
       if (isShelvedSaleLine(line, kind)) continue;
       const eventId = line.event_id || line.events?.id || null;
       const eventName = line.events?.name || "Evento";
-      const eventDate =
-        line.events?.opened_at?.slice(0, 10) || null;
+      const eventDate = eventHappenedOn({
+        name: line.events?.name,
+        opened_at: line.events?.opened_at,
+      });
       const paymentDue = line.events?.payment_due_at || null;
       const key = eventId || `ev:${eventName}:${eventDate || ""}`;
       let g = byEvent.get(key);
@@ -856,7 +913,10 @@ export default function ClienteDetailPage() {
         row = {
           eventId,
           eventName: line.events?.name || "Evento",
-          eventDate: line.events?.opened_at?.slice(0, 10) || null,
+          eventDate: eventHappenedOn({
+            name: line.events?.name,
+            opened_at: line.events?.opened_at,
+          }),
           kind,
           openItems: 0,
           paidItems: 0,
@@ -866,9 +926,9 @@ export default function ClienteDetailPage() {
       if (line.paid) row.paidItems += 1;
       else row.openItems += 1;
     }
-    return [...byId.values()]
-      .sort((a, b) => (b.eventDate || "").localeCompare(a.eventDate || ""))
-      .slice(0, 12);
+    return [...byId.values()].sort((a, b) =>
+      (b.eventDate || "").localeCompare(a.eventDate || ""),
+    );
   }, [chargeLines]);
 
   const whatsappUrl = useMemo(() => {
@@ -1446,8 +1506,7 @@ export default function ClienteDetailPage() {
         {eventHistory.length > 0 ? (
           <div>
             <h3 className="mb-2 text-sm font-semibold text-zinc-800">
-              Eventos deste cliente ({eventHistory.length}
-              {eventHistory.length >= 12 ? "+" : ""})
+              Eventos deste cliente ({eventHistory.length})
             </h3>
             <ul className="flex flex-wrap gap-2">
               {eventHistory.map((ev) => (

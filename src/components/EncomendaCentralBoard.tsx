@@ -5,6 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "@/components/Badge";
 import { EmptyState } from "@/components/EmptyState";
 import { createClient } from "@/lib/supabase/client";
+import { fetchAllQueryRows } from "@/lib/customers";
+import { eventHappenedOn } from "@/lib/event-date";
 import { isShelvedSaleLine } from "@/lib/leilao-resultado";
 import type {
   Event,
@@ -108,10 +110,23 @@ export function EncomendaCentralBoard() {
         .select("*")
         .eq("kind", "encomenda")
         .order("opened_at", { ascending: false }),
-      supabase
-        .from("event_sale_lines")
-        .select("*, customers(id, name, phone)")
-        .order("created_at"),
+      (async () => {
+        try {
+          const rows = await fetchAllQueryRows<EventSaleLine>((from, to) =>
+            supabase
+              .from("event_sale_lines")
+              .select("*, customers(id, name, phone)")
+              .order("created_at", { ascending: true })
+              .range(from, to),
+          );
+          return { data: rows, error: null as { message: string } | null };
+        } catch (e) {
+          return {
+            data: null as EventSaleLine[] | null,
+            error: { message: e instanceof Error ? e.message : String(e) },
+          };
+        }
+      })(),
       supabase.from("event_product_stock").select("*"),
     ]);
 
@@ -183,7 +198,10 @@ export function EncomendaCentralBoard() {
         group = {
           eventId: ev.id,
           eventName: ev.name,
-          eventDate: ev.opened_at,
+          eventDate: eventHappenedOn({
+            name: ev.name,
+            opened_at: ev.opened_at,
+          }),
           eventStatus: ev.status,
           products: [],
           ordered: 0,
@@ -203,12 +221,15 @@ export function EncomendaCentralBoard() {
           key: stockKey(ev.id, title),
           eventId: ev.id,
           eventName: ev.name,
-          eventDate: ev.opened_at,
+          eventDate: eventHappenedOn({
+            name: ev.name,
+            opened_at: ev.opened_at,
+          }),
           eventStatus: ev.status,
           title,
           people: 0,
           ordered: 0,
-          arrived: st?.qty_arrived ?? 0,
+          arrived: 0,
           pedidoFeito: Boolean(st?.pedido_feito),
           shipped: 0,
           lines: [],
@@ -218,6 +239,11 @@ export function EncomendaCentralBoard() {
       product.ordered += lineQty(line);
       product.people += 1;
       product.shipped += lineShippedQty(line, garageById);
+      const lineArr = Math.max(
+        0,
+        Math.min(lineQty(line), Number(line.qty_arrived) || 0),
+      );
+      product.arrived += lineArr;
       product.lines.push(line);
     }
 
@@ -232,6 +258,11 @@ export function EncomendaCentralBoard() {
             b.customers?.name || b.customer_name_snapshot || b.phone_digits || "";
           return na.localeCompare(nb, "pt-BR");
         });
+        // Se ainda ninguém marcou por linha, cai no total antigo do produto
+        if (p.arrived === 0) {
+          const st = stockMap.get(stockKey(g.eventId, p.title));
+          p.arrived = Math.min(p.ordered, st?.qty_arrived ?? 0);
+        }
         g.ordered += p.ordered;
         g.arrived += p.arrived;
         g.shipped += p.shipped;

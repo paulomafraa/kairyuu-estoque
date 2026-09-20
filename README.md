@@ -32,7 +32,20 @@ Cada versão ampliou o escopo: do inventário local → multi-usuário na nuvem 
 cp .env.example .env.local
 ```
 
-Preencha `NEXT_PUBLIC_SUPABASE_URL` e `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
+Preencha no mínimo:
+
+- `NEXT_PUBLIC_SUPABASE_URL` e `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY` (cria contas aprovadas)
+- `OWNER_APPROVAL_EMAIL` (seu e-mail pessoal — recebe o código)
+- `RESEND_API_KEY` (envio do código)
+- `GEMINI_API_KEY` (assistente IA)
+- `ESTOQUE_BOT_API_KEY` (mesmo valor de `ESTOQUE_BOT_KEY` no bot — sync `!inativos`)
+
+**Importante (segurança):** no Supabase, desative o cadastro público (“Allow new users to sign up”). Rode `supabase/migration_signup_approvals.sql`.
+
+Para o filtro **Inativos do grupo** na aba Clientes, rode também `supabase/migration_whatsapp_group_activity.sql` e use `!inativos loja` na auditoria do WhatsApp (bot com `ESTOQUE_URL` + `ESTOQUE_BOT_KEY`). Critério: 0 msgs no grupo e **sem ficha** em Clientes (cadastro já protege, mesmo sem compra).
+
+No Vercel, as mesmas variáveis precisam existir no projeto.
 
 4. Rode:
 

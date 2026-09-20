@@ -8,6 +8,7 @@ import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { EncomendaCentralBoard } from "@/components/EncomendaCentralBoard";
 import { createClient } from "@/lib/supabase/client";
+import { fetchAllCustomers } from "@/lib/customers";
 import { ORDER_STATUS_FLOW, ORDER_STATUS_LABEL, cardLabel } from "@/lib/labels";
 import type { Card, Customer, Order, OrderStatus, Profile } from "@/lib/types";
 
@@ -75,7 +76,10 @@ export default function EncomendasPage() {
         .from("orders")
         .select("*, customers(*), cards(*)")
         .order("created_at", { ascending: false }),
-      supabase.from("customers").select("*").order("name"),
+      fetchAllCustomers(supabase).then(
+        (rows) => ({ data: rows, error: null as Error | null }),
+        (e: Error) => ({ data: [] as Customer[], error: e }),
+      ),
       supabase.from("cards").select("*").order("name"),
       supabase.from("profiles").select("id, name"),
     ]);
@@ -95,7 +99,8 @@ export default function EncomendasPage() {
         })),
       );
     }
-    setCustomers((cu.data as Customer[]) || []);
+    if (cu.error) setError(cu.error.message);
+    setCustomers(cu.data || []);
     setCards((cd.data as Card[]) || []);
   }, [supabase]);
 

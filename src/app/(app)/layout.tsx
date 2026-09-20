@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { AppNav } from "@/components/AppNav";
+import { StaffAiChat } from "@/components/StaffAiChat";
 import { isSupabaseConfigured } from "@/lib/env";
 import { createClient } from "@/lib/supabase/server";
 
@@ -30,7 +31,10 @@ export default async function AppLayout({
   return (
     <div className="min-h-full">
       <AppNav userName={profile?.name || user.email || undefined} />
-      <main className="mx-auto w-full max-w-[1600px] px-4 py-6 lg:px-6">{children}</main>
+      <main className="mx-auto w-full max-w-[1600px] px-4 py-6 lg:px-6">
+        {children}
+      </main>
+      <StaffAiChat />
     </div>
   );
 }

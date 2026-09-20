@@ -14,6 +14,7 @@ import {
   LEILAO_GARAGE_LIMIT_DAYS,
   LEILAO_GARAGE_WARN_DAYS,
 } from "@/lib/cobranca-msg";
+import { eventHappenedOn } from "@/lib/event-date";
 import type { GarageItem, Event } from "@/lib/types";
 
 type OwedRow = GarageItem & {
@@ -81,7 +82,10 @@ function isLeilaoRow(row: OwedRow): boolean {
 function inLeilaoShipWindow(row: OwedRow, daysHeld: number | null): boolean {
   if (daysHeld != null && daysHeld >= 50) return true;
   const eventIso =
-    row.events?.opened_at?.slice(0, 10) || row.event_date || null;
+    eventHappenedOn({
+      name: row.events?.name,
+      opened_at: row.events?.opened_at,
+    }) || row.event_date || null;
   if (eventIso) {
     const daysEvent = daysSincePayment(`${eventIso}T12:00:00`);
     if (daysEvent != null && daysEvent >= 0 && daysEvent <= 65) return true;
@@ -132,7 +136,10 @@ export default function EnviosPage() {
       const eventName =
         row.events?.name || row.event_name || "Sem evento (venda / manual)";
       const eventDate =
-        row.events?.opened_at?.slice(0, 10) || row.event_date || null;
+        eventHappenedOn({
+          name: row.events?.name,
+          opened_at: row.events?.opened_at,
+        }) || row.event_date || null;
       const key = eventId || `manual:${eventName}:${eventDate || ""}`;
       let g = byEvent.get(key);
       if (!g) {
@@ -192,7 +199,10 @@ export default function EnviosPage() {
       const eventName =
         row.events?.name || row.event_name || "Leilão sem nome";
       const eventDate =
-        row.events?.opened_at?.slice(0, 10) || row.event_date || null;
+        eventHappenedOn({
+          name: row.events?.name,
+          opened_at: row.events?.opened_at,
+        }) || row.event_date || null;
       const key = eventId || `leilao:${eventName}:${eventDate || ""}`;
       let g = byEvent.get(key);
       if (!g) {

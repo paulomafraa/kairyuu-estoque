@@ -1,7 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useParams } from "next/navigation";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/Badge";
@@ -10,8 +17,18 @@ import { ConfirmButton } from "@/components/ConfirmButton";
 import { EventResumoPanel } from "@/components/EventResumoPanel";
 import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
+import { eventHappenedAtIso, eventHappenedOn } from "@/lib/event-date";
 import { EVENT_STATUS_LABEL, cardLabel } from "@/lib/labels";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
+import {
+  buildPhoneCustomerIndex,
+  customerPhoneDigits,
+  ensureCustomerByPhone,
+  fetchAllCustomers,
+  fetchAllQueryRows,
+  looksLikePhoneName,
+  matchesCustomerQuery,
+} from "@/lib/customers";
 import { logStaffAction } from "@/lib/audit";
 import {
   parseResultadoFile,
@@ -60,12 +77,90 @@ type Participant = {
   urgency: "ok" | "warn" | "overdue" | "none";
 };
 
-/** Nome de cadastro que ainda é só o telefone (import bruto). */
-function looksLikePhoneName(name: string): boolean {
-  const digits = normalizePhoneDigits(name);
-  return digits.length >= 10 && digits === name.replace(/\D/g, "");
+/** Estágio do fluxo: vermelho → laranja → amarelo → azul → verde. */
+type ParticipantFlowStage = 0 | 1 | 2 | 3 | 4;
+
+const PARTICIPANT_FLOW_LEGEND: Array<{
+  stage: ParticipantFlowStage;
+  label: string;
+  swatch: string;
+}> = [
+  { stage: 0, label: "Nada feito", swatch: "bg-red-400" },
+  { stage: 1, label: "Cobrado", swatch: "bg-orange-400" },
+  { stage: 2, label: "Pago", swatch: "bg-amber-300" },
+  { stage: 3, label: "Separado", swatch: "bg-sky-400" },
+  { stage: 4, label: "Enviado", swatch: "bg-emerald-400" },
+];
+
+function lineAlreadyShippedWithGarage(
+  line: EventSaleLine,
+  garageById: Record<string, GarageItem>,
+): boolean {
+  if (!line.garage_item_id) return false;
+  const g = garageById[line.garage_item_id];
+  if (!g) return false;
+  return (
+    Number(g.qty_with_store) <= 0 &&
+    Number(g.qty_sent) > 0 &&
+    g.status !== "cancelled"
+  );
 }
 
+/** Estágio da linha: o mais alto vale sozinho (os anteriores estão implícitos). */
+function saleLineFlowStage(
+  line: EventSaleLine,
+  garageById: Record<string, GarageItem>,
+): ParticipantFlowStage {
+  if (lineAlreadyShippedWithGarage(line, garageById)) return 4;
+  if (line.separated) return 3;
+  if (line.paid) return 2;
+  if (line.charged) return 1;
+  return 0;
+}
+
+/** Pior estágio entre as cartas ativas do participante. */
+function participantFlowStage(
+  lines: EventSaleLine[],
+  kind: Event["kind"] | null | undefined,
+  garageById: Record<string, GarageItem>,
+): ParticipantFlowStage {
+  const active = lines.filter(
+    (l) => !l.cancelled && !isShelvedSaleLine(l, kind),
+  );
+  if (!active.length) return 0;
+  let min: ParticipantFlowStage = 4;
+  for (const l of active) {
+    const s = saleLineFlowStage(l, garageById);
+    if (s < min) min = s;
+  }
+  return min;
+}
+
+function participantFlowCardClass(
+  stage: ParticipantFlowStage,
+  selected: boolean,
+): string {
+  if (selected) {
+    const selectedByStage: Record<ParticipantFlowStage, string> = {
+      0: "bg-red-800 text-white ring-2 ring-red-950",
+      1: "bg-orange-700 text-white ring-2 ring-orange-950",
+      2: "bg-amber-600 text-white ring-2 ring-amber-900",
+      3: "bg-sky-700 text-white ring-2 ring-sky-950",
+      4: "bg-emerald-700 text-white ring-2 ring-emerald-950",
+    };
+    return selectedByStage[stage];
+  }
+  const idleByStage: Record<ParticipantFlowStage, string> = {
+    0: "bg-red-50 text-red-900 hover:bg-red-100",
+    1: "bg-orange-50 text-orange-950 hover:bg-orange-100",
+    2: "bg-amber-50 text-amber-950 hover:bg-amber-100",
+    3: "bg-sky-50 text-sky-950 hover:bg-sky-100",
+    4: "bg-emerald-50 text-emerald-950 hover:bg-emerald-100",
+  };
+  return idleByStage[stage];
+}
+
+/** Nome de cadastro que ainda é só o telefone (import bruto). */
 function displayCustomerName(
   cust: Customer | undefined | null,
   snapshot: string,
@@ -87,12 +182,6 @@ function saleLinePhone(line: EventSaleLine): string {
   return normalizePhoneDigits(
     line.phone_digits || line.customers?.phone || "",
   );
-}
-
-function customerPhoneDigits(
-  customer: Pick<Customer, "phone" | "phone_digits">,
-): string {
-  return normalizePhoneDigits(customer.phone_digits || customer.phone || "");
 }
 
 function findCustomerOnProduct(
@@ -134,6 +223,8 @@ export default function EventoDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Evita clique duplo em “Pago” criar vários itens na caixinha. */
+  const markPaidInFlight = useRef(false);
   const [showBox, setShowBox] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [includeReview, setIncludeReview] = useState(true);
@@ -147,6 +238,7 @@ export default function EventoDetailPage() {
   } | null>(null);
 
   const [paymentDue, setPaymentDue] = useState("");
+  const [eventHeldOn, setEventHeldOn] = useState("");
   const [eventNameEdit, setEventNameEdit] = useState("");
   const [editingEventName, setEditingEventName] = useState(false);
   const [allocCardId, setAllocCardId] = useState("");
@@ -177,7 +269,7 @@ export default function EventoDetailPage() {
   /** Revisão ❓: atribuir dono sem mexer em itens já pagos/organizados. */
   const [reviewLineId, setReviewLineId] = useState<string | null>(null);
   const [reviewSearch, setReviewSearch] = useState("");
-  const [reviewScope, setReviewScope] = useState<"event" | "all">("event");
+  const [reviewScope, setReviewScope] = useState<"event" | "all">("all");
   const [reviewKeep, setReviewKeep] = useState(true);
   const [stickyCustomerId, setStickyCustomerId] = useState<string | null>(null);
   const [newReviewName, setNewReviewName] = useState("");
@@ -193,7 +285,7 @@ export default function EventoDetailPage() {
   const [reassignLineId, setReassignLineId] = useState<string | null>(null);
   const [reassignReason, setReassignReason] = useState("");
   const [reassignSearch, setReassignSearch] = useState("");
-  const [reassignScope, setReassignScope] = useState<"event" | "all">("event");
+  const [reassignScope, setReassignScope] = useState<"event" | "all">("all");
   const [showReassignNew, setShowReassignNew] = useState(false);
   const [reassignNewName, setReassignNewName] = useState("");
   const [reassignNewPhone, setReassignNewPhone] = useState("");
@@ -202,6 +294,9 @@ export default function EventoDetailPage() {
   const [controlReason, setControlReason] = useState("");
   const [orphanLineId, setOrphanLineId] = useState<string | null>(null);
   const [orphanSearch, setOrphanSearch] = useState("");
+  const [showOrphanNew, setShowOrphanNew] = useState(false);
+  const [orphanNewName, setOrphanNewName] = useState("");
+  const [orphanNewPhone, setOrphanNewPhone] = useState("");
   const [detachLineId, setDetachLineId] = useState<string | null>(null);
   const [detachReason, setDetachReason] = useState("");
   const [extraTitle, setExtraTitle] = useState("");
@@ -225,18 +320,34 @@ export default function EventoDetailPage() {
       setMeName(profile?.name || auth.data.user?.email || "Staff");
     }
 
-    const [ev, ln, cu, al, cd, ps, costs] = await Promise.all([
+    const [ev, ln, cuRows, al, cd, ps, costs] = await Promise.all([
       supabase
         .from("events")
         .select("*, profiles!owner_id(id, name, role, created_at)")
         .eq("id", eventId)
         .single(),
-      supabase
-        .from("event_sale_lines")
-        .select("*, customers(id, name, phone)")
-        .eq("event_id", eventId)
-        .order("created_at"),
-      supabase.from("customers").select("*").order("name"),
+      (async () => {
+        try {
+          const rows = await fetchAllQueryRows<EventSaleLine>((from, to) =>
+            supabase
+              .from("event_sale_lines")
+              .select("*, customers(id, name, phone)")
+              .eq("event_id", eventId)
+              .order("created_at", { ascending: true })
+              .range(from, to),
+          );
+          return { data: rows, error: null as { message: string } | null };
+        } catch (e) {
+          return {
+            data: null,
+            error: { message: e instanceof Error ? e.message : String(e) },
+          };
+        }
+      })(),
+      fetchAllCustomers(supabase).catch((e) => {
+        console.error(e);
+        return [] as Customer[];
+      }),
       supabase
         .from("event_allocations")
         .select("*, cards(*)")
@@ -257,6 +368,12 @@ export default function EventoDetailPage() {
     else {
       setEvent(ev.data as typeof event);
       setPaymentDue((ev.data as Event).payment_due_at || "");
+      setEventHeldOn(
+        eventHappenedOn({
+          name: (ev.data as Event).name,
+          opened_at: (ev.data as Event).opened_at,
+        }) || "",
+      );
       setEventNameEdit((ev.data as Event).name || "");
       setShowBox(Boolean((ev.data as Event).use_stock_box));
     }
@@ -293,7 +410,7 @@ export default function EventoDetailPage() {
       setProductStock((ps.data as EventProductStock[]) || []);
     }
 
-    setCustomers((cu.data as Customer[]) || []);
+    setCustomers(cuRows);
     if (!al.error) setAllocations((al.data as EventAllocation[]) || []);
     setCards((cd.data as Card[]) || []);
     if (costs.error) {
@@ -310,14 +427,10 @@ export default function EventoDetailPage() {
     void load();
   }, [load]);
 
-  const phoneToCustomer = useMemo(() => {
-    const map = new Map<string, Customer>();
-    for (const c of customers) {
-      const d = c.phone_digits || normalizePhoneDigits(c.phone);
-      if (d) map.set(d, c);
-    }
-    return map;
-  }, [customers]);
+  const phoneToCustomer = useMemo(
+    () => buildPhoneCustomerIndex(customers),
+    [customers],
+  );
 
   const participants = useMemo(() => {
     const byKey = new Map<string, Participant>();
@@ -330,10 +443,12 @@ export default function EventoDetailPage() {
         if (bucket === "review" || bucket === "no_votes") continue;
       }
       const phone = line.phone_digits || "";
-      const key = line.customer_id || phone || line.id;
-      const cust = line.customer_id
+      const byPhone = phone ? phoneToCustomer.get(phone) : undefined;
+      const byId = line.customer_id
         ? customers.find((c) => c.id === line.customer_id)
-        : phoneToCustomer.get(phone);
+        : undefined;
+      const cust = byPhone || byId;
+      const key = cust?.id || phone || line.id;
       const name = displayCustomerName(cust, line.customer_name_snapshot, phone);
       let p = byKey.get(key);
       if (!p) {
@@ -379,11 +494,13 @@ export default function EventoDetailPage() {
     for (const line of lines) {
       if (line.cancelled || !isShelvedSaleLine(line, kind)) continue;
       const phone = line.phone_digits || "";
-      const key = line.customer_id || phone || line.id;
-      if (activeKeys.has(key)) continue;
-      const cust = line.customer_id
+      const byPhone = phone ? phoneToCustomer.get(phone) : undefined;
+      const byId = line.customer_id
         ? customers.find((c) => c.id === line.customer_id)
-        : phoneToCustomer.get(phone);
+        : undefined;
+      const cust = byPhone || byId;
+      const key = cust?.id || phone || line.id;
+      if (activeKeys.has(key)) continue;
       const name = displayCustomerName(cust, line.customer_name_snapshot, phone);
       let p = byKey.get(key);
       if (!p) {
@@ -490,11 +607,11 @@ export default function EventoDetailPage() {
     activeMainLines.length > 0 && selectedCount === activeMainLines.length;
 
   const productSummary = useMemo(() => {
-    const arrivedMap = new Map(
-      productStock.map((s) => [s.product_title, s.qty_arrived] as const),
-    );
     const pedidoMap = new Map(
       productStock.map((s) => [s.product_title, Boolean(s.pedido_feito)] as const),
+    );
+    const stockArrivedMap = new Map(
+      productStock.map((s) => [s.product_title, s.qty_arrived] as const),
     );
     const map = new Map<
       string,
@@ -502,6 +619,7 @@ export default function EventoDetailPage() {
         title: string;
         ordered: number;
         arrived: number;
+        lineArrived: number;
         pedidoFeito: boolean;
         people: number;
         lines: EventSaleLine[];
@@ -516,18 +634,29 @@ export default function EventoDetailPage() {
         row = {
           title,
           ordered: 0,
-          arrived: arrivedMap.get(title) ?? 0,
+          arrived: 0,
+          lineArrived: 0,
           pedidoFeito: pedidoMap.get(title) ?? false,
           people: 0,
           lines: [],
         };
         map.set(title, row);
       }
-      row.ordered += Number(line.qty) > 0 ? Number(line.qty) : 1;
+      const q = Number(line.qty) > 0 ? Number(line.qty) : 1;
+      const a = Math.max(
+        0,
+        Math.min(q, Number(line.qty_arrived) > 0 ? Number(line.qty_arrived) : 0),
+      );
+      row.ordered += q;
+      row.lineArrived += a;
       row.people += 1;
       row.lines.push(line);
     }
     for (const row of map.values()) {
+      // Prefere soma por cliente; se ninguém marcou ainda, usa o total antigo do produto
+      const stockArrived = stockArrivedMap.get(row.title) ?? 0;
+      row.arrived =
+        row.lineArrived > 0 ? row.lineArrived : Math.min(row.ordered, stockArrived);
       row.lines.sort((a, b) => {
         const na =
           a.customers?.name || a.customer_name_snapshot || a.phone_digits || "";
@@ -623,10 +752,17 @@ export default function EventoDetailPage() {
   }, [leilaoBuckets.noVotes, noVotesSearch]);
 
   const filteredParticipants = useMemo(() => {
-    const q = participantSearch.trim().toLowerCase();
+    const q = participantSearch.trim();
     if (!q) return participants;
     return participants.filter((p) =>
-      `${p.name} ${p.phone}`.toLowerCase().includes(q),
+      matchesCustomerQuery(
+        {
+          name: p.name,
+          phone: p.phone,
+          phone_digits: normalizePhoneDigits(p.phone),
+        },
+        q,
+      ),
     );
   }, [participants, participantSearch]);
 
@@ -679,13 +815,18 @@ export default function EventoDetailPage() {
   }
 
   async function saveDue() {
+    const patch: {
+      payment_due_at: string | null;
+      opened_at?: string;
+    } = { payment_due_at: paymentDue || null };
+    if (eventHeldOn) patch.opened_at = eventHappenedAtIso(eventHeldOn);
     const { error: err } = await supabase
       .from("events")
-      .update({ payment_due_at: paymentDue || null })
+      .update(patch)
       .eq("id", eventId);
     if (err) setError(err.message);
     else {
-      setInfo("Prazo de pagamento atualizado.");
+      setInfo("Datas do evento atualizadas.");
       await load();
     }
   }
@@ -738,44 +879,17 @@ export default function EventoDetailPage() {
 
   async function ensureCustomer(line: ParsedSaleLine): Promise<string | null> {
     if (!line.phone_digits) return null;
-    const existing = phoneToCustomer.get(line.phone_digits);
-    if (existing) {
-      // Só preenche nome no cadastro se ainda estiver como telefone.
-      // Nunca mexe em cartas, linhas já atribuídas, garagem ou pagamentos.
-      const snap = (line.customer_name_snapshot || "").trim();
-      if (
-        snap &&
-        !looksLikePhoneName(snap) &&
-        looksLikePhoneName(existing.name)
-      ) {
-        await supabase
-          .from("customers")
-          .update({ name: snap })
-          .eq("id", existing.id);
-      }
-      return existing.id;
-    }
-    const { data, error: err } = await supabase
-      .from("customers")
-      .insert({
+    try {
+      const { customer } = await ensureCustomerByPhone(supabase, {
         name: line.customer_name_snapshot || line.phone_digits,
-        phone: line.phone_digits,
-        phone_digits: line.phone_digits,
+        phoneDigits: line.phone_digits,
         source: "whatsapp_group",
-        notes: "",
-      })
-      .select("id")
-      .single();
-    if (err) {
-      // race / unique
-      const { data: again } = await supabase
-        .from("customers")
-        .select("id")
-        .eq("phone_digits", line.phone_digits)
-        .maybeSingle();
-      return again?.id ?? null;
+      });
+      return customer.id;
+    } catch {
+      const existing = phoneToCustomer.get(line.phone_digits);
+      return existing?.id ?? null;
     }
-    return data.id;
   }
 
   async function confirmImport() {
@@ -919,6 +1033,109 @@ export default function EventoDetailPage() {
     }
   }
 
+  /** Cópia sem dono p/ multi-unidade (pessoas diferentes na mesma enquete). */
+  async function duplicateSaleLine(line: EventSaleLine) {
+    setBusy(true);
+    setError(null);
+    try {
+      const price = lineUnitPrice(line);
+      const { data, error: err } = await supabase
+        .from("event_sale_lines")
+        .insert({
+          event_id: eventId,
+          customer_id: null,
+          phone_digits: "",
+          customer_name_snapshot: "Atribuir dono",
+          product_title: line.product_title,
+          valor_ou_opcao: line.valor_ou_opcao || "",
+          unit_price: price,
+          qty: 1,
+          import_status:
+            line.import_status === "manual" ? "manual" : line.import_status,
+          certainty: "certain",
+          arremate: Boolean(line.arremate),
+          poll_id: line.poll_id || "",
+          notes: `Duplicado · multi-unidade · de ${line.id.slice(0, 8)}`,
+          separated: false,
+          charged: false,
+          paid: false,
+          cancelled: false,
+          created_by: meId,
+        })
+        .select("id")
+        .single();
+      if (err) throw err;
+      await logStaffAction(supabase, {
+        action: "Duplicar item",
+        detail: `Duplicou ${line.product_title} · multi-unidade · por ${meName}`,
+        created_by: meId,
+        entity_type: "event_sale_lines",
+        entity_id: data?.id || "",
+        event_id: eventId,
+      });
+      setInfo(
+        `Cópia criada: ${line.product_title}. Atribua o dono (Trocar dono / painel sem cliente).`,
+      );
+      if (data?.id) {
+        setReassignLineId(data.id);
+        setDetachLineId(null);
+        setReassignReason("Multi-unidade · segundo ganhador");
+        setReassignSearch("");
+        setShowReassignNew(false);
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Falha ao duplicar");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function duplicateSelectedLines() {
+    const ids = selectedIdsFromParticipant();
+    if (!ids.length) return;
+    setBusy(true);
+    setError(null);
+    try {
+      let n = 0;
+      for (const id of ids) {
+        const line = lines.find((l) => l.id === id);
+        if (!line || line.cancelled) continue;
+        const price = lineUnitPrice(line);
+        const { error: err } = await supabase.from("event_sale_lines").insert({
+          event_id: eventId,
+          customer_id: null,
+          phone_digits: "",
+          customer_name_snapshot: "Atribuir dono",
+          product_title: line.product_title,
+          valor_ou_opcao: line.valor_ou_opcao || "",
+          unit_price: price,
+          qty: 1,
+          import_status:
+            line.import_status === "manual" ? "manual" : line.import_status,
+          certainty: "certain",
+          arremate: Boolean(line.arremate),
+          poll_id: line.poll_id || "",
+          notes: `Duplicado · multi-unidade · de ${line.id.slice(0, 8)}`,
+          separated: false,
+          charged: false,
+          paid: false,
+          cancelled: false,
+          created_by: meId,
+        });
+        if (err) throw err;
+        n += 1;
+      }
+      setInfo(`Duplicados · ${n} item(ns) sem dono · atribua cada um.`);
+      setSelectedLineIds({});
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Falha ao duplicar");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function patchLines(
     ids: string[],
     patch: Record<string, unknown>,
@@ -980,71 +1197,248 @@ export default function EventoDetailPage() {
     );
   }
 
-  async function markPaid(ids: string[], value: boolean) {
-    // ao pagar, cria item na garagem se ainda não tiver
-    if (value) {
-      for (const id of ids) {
-        const line = lines.find((l) => l.id === id);
-        if (!line || line.cancelled || line.garage_item_id || !line.customer_id) continue;
-        const { data: gi, error: gErr } = await supabase
+  async function claimGarageItemForSaleLine(
+    saleLineId: string,
+    garageItemId: string,
+    opts?: { deleteOrphanIfUnclaimed?: boolean },
+  ): Promise<boolean> {
+    const { data: claimed } = await supabase
+      .from("event_sale_lines")
+      .update({ garage_item_id: garageItemId })
+      .eq("id", saleLineId)
+      .is("garage_item_id", null)
+      .select("id");
+    if (!claimed?.length) {
+      // Só apaga se ESTE insert acabou de criar o órfão. Nunca apagar o item
+      // que já existia (unique / outra aba) — senão a caixinha vencedora some.
+      if (opts?.deleteOrphanIfUnclaimed) {
+        await supabase
           .from("customer_garage_items")
-          .insert({
-            customer_id: line.customer_id,
-            title: line.product_title,
-            category: "carta",
-            qty: Number(line.qty) > 0 ? Number(line.qty) : 1,
-            qty_with_store: Number(line.qty) > 0 ? Number(line.qty) : 1,
-            qty_sent: 0,
-            qty_delivered: 0,
-            status: "in_garage",
-            origin:
-              event?.kind === "encomenda"
-                ? "encomenda"
-                : event?.kind === "leilao" ||
-                    line.import_status === "arrematado" ||
-                    line.arremate
-                  ? "leilao"
-                  : "evento",
-            event_name: event?.name || "",
-            event_date: event?.opened_at?.slice(0, 10) || null,
-            event_id: eventId,
-            unit_price: lineUnitPrice(line),
-            notes: line.valor_ou_opcao || "",
-            created_by: meId,
-          })
-          .select("id")
-          .single();
-        if (!gErr && gi) {
+          .delete()
+          .eq("id", garageItemId);
+      }
+      return false;
+    }
+    setLines((prev) =>
+      prev.map((l) =>
+        l.id === saleLineId ? { ...l, garage_item_id: garageItemId } : l,
+      ),
+    );
+    return true;
+  }
+
+  async function markPaid(ids: string[], value: boolean) {
+    if (!ids.length) return;
+    if (markPaidInFlight.current) return;
+    markPaidInFlight.current = true;
+    setBusy(true);
+    try {
+      if (!value) {
+        // Desfazer pago: só se a caixinha ainda estiver intacta (nada enviado).
+        for (const id of ids) {
+          const line = lines.find((l) => l.id === id);
+          const garageId = line?.garage_item_id;
+          if (!garageId) continue;
+          const { data: g } = await supabase
+            .from("customer_garage_items")
+            .select("id, status, qty_sent, qty_delivered")
+            .eq("id", garageId)
+            .maybeSingle();
+          if (
+            g &&
+            (Number(g.qty_sent) > 0 || Number(g.qty_delivered) > 0)
+          ) {
+            setError(
+              "Não dá para desfazer pagamento: já houve envio/entrega na caixinha. Desfaça o envio na ficha do cliente antes.",
+            );
+            return;
+          }
+          if (g && g.status !== "cancelled") {
+            await supabase
+              .from("customer_garage_items")
+              .update({
+                status: "cancelled",
+                cancelled_at: new Date().toISOString(),
+                cancelled_by: meId,
+                cancel_reason: "Pagamento desfeito",
+              })
+              .eq("id", garageId);
+          }
           await supabase
             .from("event_sale_lines")
-            .update({ garage_item_id: gi.id })
+            .update({ garage_item_id: null })
             .eq("id", id);
         }
-      }
-    }
-    await patchLines(
-      ids,
-      value
-        ? {
-            paid: true,
-            paid_at: new Date().toISOString(),
-            paid_by: meId,
-            charged: true,
-            charged_at: new Date().toISOString(),
-            charged_by: meId,
-          }
-        : {
+        await patchLines(
+          ids,
+          {
             paid: false,
             paid_at: null,
             paid_by: null,
           },
-      value ? "Pago (foi pra caixinha)" : "Pagamento desfeito",
-    );
+          "Pagamento desfeito",
+        );
+        return;
+      }
+
+      // Ao pagar: cria item na garagem só se a linha ainda não tiver vínculo ativo.
+      const payableIds: string[] = [];
+      for (const id of ids) {
+        const line = lines.find((l) => l.id === id);
+        if (!line || line.cancelled) continue;
+        if (!line.customer_id) {
+          setError(
+            `Não dá para marcar pago sem cliente vinculado: ${line.product_title}`,
+          );
+          continue;
+        }
+
+        const { data: fresh } = await supabase
+          .from("event_sale_lines")
+          .select("garage_item_id, cancelled, customer_id")
+          .eq("id", id)
+          .maybeSingle();
+        if (!fresh || fresh.cancelled || !fresh.customer_id) continue;
+
+        if (fresh.garage_item_id) {
+          const { data: existingG } = await supabase
+            .from("customer_garage_items")
+            .select("id, status")
+            .eq("id", fresh.garage_item_id)
+            .maybeSingle();
+          if (existingG && existingG.status !== "cancelled") {
+            payableIds.push(id);
+            continue;
+          }
+          // Vínculo morto (cancelado/apagado): limpa e recria
+          await supabase
+            .from("event_sale_lines")
+            .update({ garage_item_id: null })
+            .eq("id", id);
+        }
+
+        const qty = Number(line.qty) > 0 ? Number(line.qty) : 1;
+        const basePayload = {
+          customer_id: fresh.customer_id,
+          title: line.product_title,
+          category: "carta",
+          qty,
+          qty_with_store: qty,
+          qty_sent: 0,
+          qty_delivered: 0,
+          status: "in_garage",
+          origin:
+            event?.kind === "encomenda"
+              ? "encomenda"
+              : event?.kind === "leilao" ||
+                  line.import_status === "arrematado" ||
+                  line.arremate
+                ? "leilao"
+                : "evento",
+          event_name: event?.name || "",
+          event_date:
+            eventHappenedOn({
+              name: event?.name,
+              opened_at: event?.opened_at,
+            }) || null,
+          event_id: eventId,
+          unit_price: lineUnitPrice(line),
+          notes: line.valor_ou_opcao || "",
+          created_by: meId,
+        };
+
+        let insert = await supabase
+          .from("customer_garage_items")
+          .insert({ ...basePayload, event_sale_line_id: id })
+          .select("id")
+          .single();
+
+        if (
+          insert.error &&
+          (insert.error.message.includes("event_sale_line_id") ||
+            insert.error.code === "PGRST204")
+        ) {
+          insert = await supabase
+            .from("customer_garage_items")
+            .insert(basePayload)
+            .select("id")
+            .single();
+        }
+
+        if (insert.error?.code === "23505") {
+          const { data: existing } = await supabase
+            .from("customer_garage_items")
+            .select("id, status")
+            .eq("event_sale_line_id", id)
+            .maybeSingle();
+          if (existing?.id) {
+            if (existing.status === "cancelled") {
+              await supabase
+                .from("customer_garage_items")
+                .update({
+                  status: "in_garage",
+                  cancelled_at: null,
+                  cancelled_by: null,
+                  cancel_reason: "",
+                  qty,
+                  qty_with_store: qty,
+                  qty_sent: 0,
+                  qty_delivered: 0,
+                })
+                .eq("id", existing.id);
+            }
+            await claimGarageItemForSaleLine(id, existing.id);
+            payableIds.push(id);
+          }
+          continue;
+        }
+
+        if (insert.error || !insert.data) continue;
+        const linked = await claimGarageItemForSaleLine(id, insert.data.id, {
+          deleteOrphanIfUnclaimed: true,
+        });
+        if (linked) payableIds.push(id);
+        else {
+          // Outra aba já vinculou — ainda pode marcar pago
+          const { data: again } = await supabase
+            .from("event_sale_lines")
+            .select("garage_item_id")
+            .eq("id", id)
+            .maybeSingle();
+          if (again?.garage_item_id) payableIds.push(id);
+        }
+      }
+
+      if (!payableIds.length) {
+        setError(
+          "Nenhum item pôde ser marcado como pago (falta cliente ou caixinha).",
+        );
+        return;
+      }
+      await patchLines(
+        payableIds,
+        {
+          paid: true,
+          paid_at: new Date().toISOString(),
+          paid_by: meId,
+          charged: true,
+          charged_at: new Date().toISOString(),
+          charged_by: meId,
+        },
+        "Pago (foi pra caixinha)",
+      );
+    } finally {
+      markPaidInFlight.current = false;
+      setBusy(false);
+    }
   }
 
   async function markShipped(ids: string[]) {
     if (!ids.length) return;
+    if (busy) return;
+    setBusy(true);
     setError(null);
+    try {
     const ready = ids
       .map((id) => lines.find((l) => l.id === id))
       .filter((l): l is EventSaleLine => Boolean(l))
@@ -1164,9 +1558,13 @@ export default function EventoDetailPage() {
     );
     setSelectedLineIds({});
     await load();
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function cancelLines(ids: string[]) {
+    if (!ids.length) return;
     const reason = window.prompt(
       "Motivo do cancelamento (obrigatório): cliente não pagou, desistiu, etc.",
     );
@@ -1175,9 +1573,14 @@ export default function EventoDetailPage() {
       setError("Informe o motivo do cancelamento.");
       return;
     }
-    for (const id of ids) {
-      const line = lines.find((l) => l.id === id);
-      if (line?.garage_item_id) {
+    setBusy(true);
+    try {
+      const { data: freshLines } = await supabase
+        .from("event_sale_lines")
+        .select("id, garage_item_id")
+        .in("id", ids);
+      for (const row of freshLines || []) {
+        if (!row.garage_item_id) continue;
         await supabase
           .from("customer_garage_items")
           .update({
@@ -1186,19 +1589,21 @@ export default function EventoDetailPage() {
             cancelled_by: meId,
             cancel_reason: reason.trim(),
           })
-          .eq("id", line.garage_item_id);
+          .eq("id", row.garage_item_id);
       }
+      await patchLines(
+        ids,
+        {
+          cancelled: true,
+          cancel_reason: reason.trim(),
+          cancelled_at: new Date().toISOString(),
+          cancelled_by: meId,
+        },
+        "Cancelado",
+      );
+    } finally {
+      setBusy(false);
     }
-    await patchLines(
-      ids,
-      {
-        cancelled: true,
-        cancel_reason: reason.trim(),
-        cancelled_at: new Date().toISOString(),
-        cancelled_by: meId,
-      },
-      "Cancelado",
-    );
   }
 
   function selectedIdsFromParticipant(): string[] {
@@ -1256,12 +1661,125 @@ export default function EventoDetailPage() {
 
   async function updateLineQty(lineId: string, qty: number) {
     const n = Math.max(1, Math.floor(qty) || 1);
+    const line = lines.find((l) => l.id === lineId);
+    const prevArrived = Math.max(0, Number(line?.qty_arrived) || 0);
+    const nextArrived = Math.min(prevArrived, n);
     const { error: err } = await supabase
       .from("event_sale_lines")
-      .update({ qty: n })
+      .update({ qty: n, qty_arrived: nextArrived })
       .eq("id", lineId);
-    if (err) setError(err.message);
-    else await load();
+    if (err) {
+      setError(
+        err.message.includes("qty_arrived")
+          ? `${err.message} — rode supabase/migration_encomenda_line_arrived.sql`
+          : err.message,
+      );
+      return;
+    }
+    if (line?.product_title) {
+      await syncProductArrivedFromLines(line.product_title);
+    }
+    // Se já está na caixinha e ainda não saiu, alinha a quantidade
+    if (line?.garage_item_id) {
+      const g =
+        garageById[line.garage_item_id] ||
+        (
+          await supabase
+            .from("customer_garage_items")
+            .select("id, status, qty_sent, qty_delivered")
+            .eq("id", line.garage_item_id)
+            .maybeSingle()
+        ).data;
+      if (
+        g &&
+        g.status !== "cancelled" &&
+        Number(g.qty_sent) === 0 &&
+        Number(g.qty_delivered) === 0
+      ) {
+        const { error: gErr } = await supabase
+          .from("customer_garage_items")
+          .update({ qty: n, qty_with_store: n })
+          .eq("id", g.id);
+        if (gErr) {
+          setError(
+            `Qtd da linha atualizada, mas a caixinha não acompanhou: ${gErr.message}`,
+          );
+        }
+      }
+    }
+    await load();
+  }
+
+  async function syncProductArrivedFromLines(title: string) {
+    const kind = event?.kind;
+    const related = lines.filter(
+      (l) =>
+        l.product_title === title &&
+        !l.cancelled &&
+        !isShelvedSaleLine(l, kind),
+    );
+    // Relê do banco para não usar estado stale após updates
+    const { data: fresh } = await supabase
+      .from("event_sale_lines")
+      .select("id, qty, qty_arrived, cancelled, archived, valor_ou_opcao")
+      .eq("event_id", eventId)
+      .eq("product_title", title)
+      .eq("cancelled", false);
+    const rows = (fresh || []).filter(
+      (l) => !isShelvedSaleLine(l, kind),
+    );
+    const total = rows.reduce((sum, l) => {
+      const q = Number(l.qty) > 0 ? Number(l.qty) : 1;
+      const a = Math.max(0, Math.min(q, Number(l.qty_arrived) || 0));
+      return sum + a;
+    }, 0);
+    const current = productStock.find((s) => s.product_title === title);
+    await supabase.from("event_product_stock").upsert(
+      {
+        event_id: eventId,
+        product_title: title,
+        qty_arrived: total,
+        pedido_feito: current?.pedido_feito ?? false,
+        pedido_feito_at: current?.pedido_feito_at ?? null,
+        pedido_feito_by: current?.pedido_feito_by ?? null,
+        updated_at: new Date().toISOString(),
+        updated_by: meId,
+      },
+      { onConflict: "event_id,product_title" },
+    );
+    void related;
+  }
+
+  async function setLineArrived(lineId: string, qtyArrived: number) {
+    const line = lines.find((l) => l.id === lineId);
+    if (!line) return;
+    const q = Number(line.qty) > 0 ? Number(line.qty) : 1;
+    const n = Math.max(0, Math.min(q, Math.floor(qtyArrived) || 0));
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("event_sale_lines")
+      .update({ qty_arrived: n })
+      .eq("id", lineId);
+    if (err) {
+      setBusy(false);
+      setError(
+        err.message.includes("qty_arrived")
+          ? `${err.message} — rode supabase/migration_encomenda_line_arrived.sql`
+          : err.message,
+      );
+      return;
+    }
+    await syncProductArrivedFromLines(line.product_title);
+    setBusy(false);
+    setInfo(
+      n >= q
+        ? `Chegou · ${line.product_title} (${n}/${q})`
+        : n > 0
+          ? `Chegada parcial · ${line.product_title} (${n}/${q})`
+          : `Chegada desmarcada · ${line.product_title}`,
+    );
+    await load();
   }
 
   function productSalePrice(
@@ -1406,30 +1924,34 @@ export default function EventoDetailPage() {
       return;
     }
     const qty = Math.max(1, Number(addVoteQtyByTitle[productTitle]) || 1);
-    const existing = phoneToCustomer.get(phone);
-    if (existing) {
-      await addCustomerToProduct(productTitle, existing, qty);
-      return;
-    }
     setBusy(true);
     setError(null);
-    const { data, error: err } = await supabase
-      .from("customers")
-      .insert({
-        name,
-        phone,
-        phone_digits: phone,
-        source: "manual",
-        notes: "",
-      })
-      .select("id, name, phone, phone_digits")
-      .single();
-    setBusy(false);
-    if (err) {
-      setError(err.message);
-      return;
+    try {
+      const { customer, created, renamed } = await ensureCustomerByPhone(
+        supabase,
+        { name, phoneDigits: phone },
+      );
+      setCustomers((prev) => {
+        if (prev.some((c) => c.id === customer.id)) {
+          return prev.map((c) => (c.id === customer.id ? { ...c, ...customer } : c));
+        }
+        return [...prev, customer];
+      });
+      if (!created && !renamed) {
+        setInfo(
+          `Telefone já cadastrado como ${customer.name}. Adicionando na carta.`,
+        );
+      } else if (renamed) {
+        setInfo(`Nome atualizado para ${customer.name}.`);
+      }
+      setAddVoteNewName("");
+      setAddVoteNewPhone("");
+      setAddVoteShowNewFor(null);
+      await addCustomerToProduct(productTitle, customer, qty);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
     }
-    await addCustomerToProduct(productTitle, data as Customer, qty);
   }
 
   async function updateLinePrice(lineId: string, raw: string) {
@@ -1473,7 +1995,10 @@ export default function EventoDetailPage() {
         activeParticipant.phone,
         looksLikePhoneName,
       ),
-      eventDate: event.opened_at,
+      eventDate: eventHappenedOn({
+        name: event.name,
+        opened_at: event.opened_at,
+      }),
       paymentDue: event.payment_due_at,
       lines: linesForMsg,
     });
@@ -1786,36 +2311,38 @@ export default function EventoDetailPage() {
       setError("Informe um telefone válido (10–15 dígitos).");
       return;
     }
-    const existing = phoneToCustomer.get(phone);
-    if (existing) {
-      await assignReviewToCustomer(lineId, existing);
-      setNewReviewName("");
-      setNewReviewPhone("");
-      setShowNewReview(false);
+    if (reviewReason.trim().length < 3) {
+      setError("Informe o motivo da associação (obrigatório).");
       return;
     }
     setBusy(true);
     setError(null);
-    const { data, error: err } = await supabase
-      .from("customers")
-      .insert({
-        name,
-        phone,
-        phone_digits: phone,
-        source: "manual",
-        notes: "",
-      })
-      .select("id, name, phone, phone_digits")
-      .single();
-    setBusy(false);
-    if (err) {
-      setError(err.message);
-      return;
+    try {
+      const { customer, created, renamed } = await ensureCustomerByPhone(
+        supabase,
+        { name, phoneDigits: phone },
+      );
+      setCustomers((prev) => {
+        if (prev.some((c) => c.id === customer.id)) {
+          return prev.map((c) => (c.id === customer.id ? { ...c, ...customer } : c));
+        }
+        return [...prev, customer];
+      });
+      if (!created && !renamed) {
+        setInfo(
+          `Telefone já cadastrado como ${customer.name}. Associando nesta carta.`,
+        );
+      } else if (renamed) {
+        setInfo(`Nome atualizado para ${customer.name}.`);
+      }
+      setNewReviewName("");
+      setNewReviewPhone("");
+      setShowNewReview(false);
+      await assignReviewToCustomer(lineId, customer);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
     }
-    setNewReviewName("");
-    setNewReviewPhone("");
-    setShowNewReview(false);
-    await assignReviewToCustomer(lineId, data as Customer);
   }
 
   async function changeLineOwner(
@@ -1895,57 +2422,74 @@ export default function EventoDetailPage() {
       setError("Informe o motivo da troca de dono (obrigatório).");
       return;
     }
-    const existing = phoneToCustomer.get(phone);
-    if (existing) {
-      await changeLineOwner(lineId, existing, reassignReason);
+    setBusy(true);
+    setError(null);
+    try {
+      const { customer, created, renamed } = await ensureCustomerByPhone(
+        supabase,
+        { name, phoneDigits: phone },
+      );
+      setCustomers((prev) => {
+        if (prev.some((c) => c.id === customer.id)) {
+          return prev.map((c) => (c.id === customer.id ? { ...c, ...customer } : c));
+        }
+        return [...prev, customer];
+      });
+      if (!created && !renamed) {
+        setInfo(
+          `Telefone já cadastrado como ${customer.name}. Trocando dono para esse cadastro.`,
+        );
+      } else if (renamed) {
+        setInfo(`Nome atualizado para ${customer.name}.`);
+      }
+      setReassignNewName("");
+      setReassignNewPhone("");
+      setShowReassignNew(false);
+      await changeLineOwner(lineId, customer, reassignReason);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  async function createCustomerAndAssignOrphan(lineId: string) {
+    const phone = normalizePhoneDigits(orphanNewPhone);
+    const name = orphanNewName.trim() || phone;
+    if (!phone || phone.length < 10) {
+      setError("Informe um telefone válido (10–15 dígitos).");
+      return;
+    }
+    if (controlReason.trim().length < 3) {
+      setError("Informe o motivo da associação (obrigatório).");
       return;
     }
     setBusy(true);
     setError(null);
-    const { data, error: err } = await supabase
-      .from("customers")
-      .insert({
-        name,
-        phone,
-        phone_digits: phone,
-        source: "manual",
-        notes: "",
-      })
-      .select("id, name, phone, phone_digits")
-      .single();
-    setBusy(false);
-    if (err) {
-      setError(err.message);
-      return;
-    }
-    await changeLineOwner(lineId, data as Customer, reassignReason);
-  }
-
-  async function saveArrived(title: string, qtyArrived: number) {
-    const n = Math.max(0, Math.floor(qtyArrived) || 0);
-    const current = productStock.find((s) => s.product_title === title);
-    const { error: err } = await supabase.from("event_product_stock").upsert(
-      {
-        event_id: eventId,
-        product_title: title,
-        qty_arrived: n,
-        pedido_feito: current?.pedido_feito ?? false,
-        pedido_feito_at: current?.pedido_feito_at ?? null,
-        pedido_feito_by: current?.pedido_feito_by ?? null,
-        updated_at: new Date().toISOString(),
-        updated_by: meId,
-      },
-      { onConflict: "event_id,product_title" },
-    );
-    if (err) {
-      setError(
-        err.message.includes("pedido_feito")
-          ? `${err.message} — rode supabase/migration_encomenda_pedido_feito.sql`
-          : err.message,
+    try {
+      const { customer, created, renamed } = await ensureCustomerByPhone(
+        supabase,
+        { name, phoneDigits: phone },
       );
-    } else {
-      setInfo(`Chegada atualizada: ${title}`);
-      await load();
+      setCustomers((prev) => {
+        if (prev.some((c) => c.id === customer.id)) {
+          return prev.map((c) => (c.id === customer.id ? { ...c, ...customer } : c));
+        }
+        return [...prev, customer];
+      });
+      if (!created && !renamed) {
+        setInfo(
+          `Telefone já cadastrado como ${customer.name}. Associando nesta carta.`,
+        );
+      } else if (renamed) {
+        setInfo(`Nome atualizado para ${customer.name}.`);
+      }
+      setOrphanNewName("");
+      setOrphanNewPhone("");
+      setShowOrphanNew(false);
+      await assignOwnerControlled(lineId, customer, controlReason, ["no_votes"]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
     }
   }
 
@@ -1980,8 +2524,40 @@ export default function EventoDetailPage() {
     }
   }
 
-  async function markProductFullyArrived(title: string, ordered: number) {
-    await saveArrived(title, ordered);
+  async function markProductFullyArrived(title: string, _ordered: number) {
+    const kind = event?.kind;
+    const targets = lines.filter(
+      (l) =>
+        l.product_title === title &&
+        !l.cancelled &&
+        !isShelvedSaleLine(l, kind),
+    );
+    if (!targets.length) return;
+    setBusy(true);
+    setError(null);
+    try {
+      for (const line of targets) {
+        const q = Number(line.qty) > 0 ? Number(line.qty) : 1;
+        const { error: err } = await supabase
+          .from("event_sale_lines")
+          .update({ qty_arrived: q })
+          .eq("id", line.id);
+        if (err) throw err;
+      }
+      await syncProductArrivedFromLines(title);
+      setInfo(`Chegaram todas · ${title}`);
+      await load();
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message.includes("qty_arrived")
+            ? `${e.message} — rode supabase/migration_encomenda_line_arrived.sql`
+            : e.message
+          : "Falha ao marcar chegada",
+      );
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function markAllProductsFullyArrived() {
@@ -1989,27 +2565,32 @@ export default function EventoDetailPage() {
     setBusy(true);
     setError(null);
     try {
-      const rows = productSummary.map((row) => {
-        const current = productStock.find((s) => s.product_title === row.title);
-        return {
-          event_id: eventId,
-          product_title: row.title,
-          qty_arrived: row.ordered,
-          pedido_feito: current?.pedido_feito ?? false,
-          pedido_feito_at: current?.pedido_feito_at ?? null,
-          pedido_feito_by: current?.pedido_feito_by ?? null,
-          updated_at: new Date().toISOString(),
-          updated_by: meId,
-        };
-      });
-      const { error: err } = await supabase
-        .from("event_product_stock")
-        .upsert(rows, { onConflict: "event_id,product_title" });
-      if (err) throw err;
-      setInfo(`Chegou tudo da rodada · ${rows.length} produto(s)`);
+      const kind = event?.kind;
+      const targets = lines.filter(
+        (l) => !l.cancelled && !isShelvedSaleLine(l, kind),
+      );
+      for (const line of targets) {
+        const q = Number(line.qty) > 0 ? Number(line.qty) : 1;
+        const { error: err } = await supabase
+          .from("event_sale_lines")
+          .update({ qty_arrived: q })
+          .eq("id", line.id);
+        if (err) throw err;
+      }
+      const titles = [...new Set(targets.map((l) => l.product_title))];
+      for (const title of titles) {
+        await syncProductArrivedFromLines(title);
+      }
+      setInfo(`Chegou tudo da rodada · ${titles.length} produto(s)`);
       await load();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Falha ao marcar chegada");
+      setError(
+        e instanceof Error
+          ? e.message.includes("qty_arrived")
+            ? `${e.message} — rode supabase/migration_encomenda_line_arrived.sql`
+            : e.message
+          : "Falha ao marcar chegada",
+      );
     } finally {
       setBusy(false);
     }
@@ -2100,12 +2681,23 @@ export default function EventoDetailPage() {
         </p>
       ) : null}
 
-      <div className="panel mb-6 grid gap-3 sm:grid-cols-3">
+      <div className="panel mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <div>
           <Badge tone={event.status === "open" ? "good" : "neutral"}>
             {EVENT_STATUS_LABEL[event.status]}
           </Badge>
         </div>
+        <label className="text-sm">
+          <span className="mb-1 block text-zinc-600">
+            Data do evento (dia do leilão/encomenda)
+          </span>
+          <input
+            className="field"
+            type="date"
+            value={eventHeldOn}
+            onChange={(e) => setEventHeldOn(e.target.value)}
+          />
+        </label>
         <label className="text-sm">
           <span className="mb-1 block text-zinc-600">Prazo de pagamento</span>
           <div className="flex gap-2">
@@ -2505,6 +3097,15 @@ export default function EventoDetailPage() {
                           ) : (
                             <Badge tone="bad">em aberto</Badge>
                           )}
+                          <button
+                            type="button"
+                            className="text-xs font-medium text-sky-800 underline"
+                            disabled={busy}
+                            title="Cria outra unidade sem dono (multi-unidade / pessoas diferentes)"
+                            onClick={() => void duplicateSaleLine(l)}
+                          >
+                            Duplicar
+                          </button>
                           {canReassign ? (
                             <>
                               <button
@@ -2618,23 +3219,32 @@ export default function EventoDetailPage() {
                             <ul className="max-h-32 space-y-1 overflow-y-auto">
                               {(reassignScope === "event"
                                 ? participants
-                                    .map((p) =>
-                                      p.customer_id
-                                        ? customers.find(
-                                            (c) => c.id === p.customer_id,
-                                          )
-                                        : null,
-                                    )
+                                    .map((p) => {
+                                      if (!p.customer_id) return null;
+                                      const existing = customers.find(
+                                        (c) => c.id === p.customer_id,
+                                      );
+                                      if (existing) return existing;
+                                      return {
+                                        id: p.customer_id,
+                                        name: p.name,
+                                        phone: p.phone,
+                                        phone_digits: normalizePhoneDigits(
+                                          p.phone,
+                                        ),
+                                        notes: "",
+                                        created_at: "",
+                                      } as Customer;
+                                    })
                                     .filter(Boolean)
                                 : customers
                               )
                                 .filter((c): c is Customer => {
                                   if (!c || c.id === l.customer_id) return false;
-                                  const q = reassignSearch.trim().toLowerCase();
-                                  if (!q) return true;
-                                  return `${c.name} ${c.phone} ${c.phone_digits || ""}`
-                                    .toLowerCase()
-                                    .includes(q);
+                                  return matchesCustomerQuery(
+                                    c,
+                                    reassignSearch,
+                                  );
                                 })
                                 .slice(0, 30)
                                 .map((c) => (
@@ -2697,6 +3307,11 @@ export default function EventoDetailPage() {
                                 >
                                   Criar e confirmar troca
                                 </button>
+                                <p className="text-[11px] text-zinc-500">
+                                  Precisa de nome + WhatsApp. Se o número já
+                                  existir, usa o cadastro antigo (e atualiza o
+                                  nome se ainda for só o telefone).
+                                </p>
                               </div>
                             )}
                           </div>
@@ -2762,19 +3377,24 @@ export default function EventoDetailPage() {
                   const eventCustomers = participants
                     .map((p) => {
                       if (!p.customer_id) return null;
-                      const c = customers.find((x) => x.id === p.customer_id);
-                      return c || null;
+                      const existing = customers.find(
+                        (x) => x.id === p.customer_id,
+                      );
+                      if (existing) return existing;
+                      return {
+                        id: p.customer_id,
+                        name: p.name,
+                        phone: p.phone,
+                        phone_digits: normalizePhoneDigits(p.phone),
+                        notes: "",
+                        created_at: "",
+                      } as Customer;
                     })
                     .filter(Boolean) as Customer[];
                   const pool =
                     reviewScope === "event" ? eventCustomers : customers;
                   const filtered = pool
-                    .filter((c) => {
-                      if (!q) return true;
-                      const hay =
-                        `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
-                      return hay.includes(q);
-                    })
+                    .filter((c) => matchesCustomerQuery(c, q))
                     .slice(0, 40);
                   const sticky = stickyCustomerId
                     ? customers.find((c) => c.id === stickyCustomerId)
@@ -2972,6 +3592,7 @@ export default function EventoDetailPage() {
                           );
                           setControlReason("");
                           setOrphanSearch("");
+                          setShowOrphanNew(false);
                         }}
                       >
                         {l.product_title}
@@ -2987,13 +3608,28 @@ export default function EventoDetailPage() {
                     (l) => l.id === orphanLineId,
                   )!;
                   const q = orphanSearch.trim().toLowerCase();
-                  const filtered = customers
-                    .filter((c) => {
-                      if (!q) return true;
-                      return `${c.name} ${c.phone} ${c.phone_digits || ""}`
-                        .toLowerCase()
-                        .includes(q);
-                    })
+                  const fromParticipants = participants
+                    .filter((p) => p.customer_id)
+                    .map((p) => {
+                      const existing = customers.find(
+                        (c) => c.id === p.customer_id,
+                      );
+                      if (existing) return existing;
+                      return {
+                        id: p.customer_id!,
+                        name: p.name,
+                        phone: p.phone,
+                        phone_digits: normalizePhoneDigits(p.phone),
+                        notes: "",
+                        created_at: "",
+                      } as Customer;
+                    });
+                  const poolMap = new Map<string, Customer>();
+                  for (const c of [...fromParticipants, ...customers]) {
+                    poolMap.set(c.id, c);
+                  }
+                  const filtered = [...poolMap.values()]
+                    .filter((c) => matchesCustomerQuery(c, q))
                     .slice(0, 40);
                   return (
                     <div className="mt-3 space-y-2 rounded-md border border-zinc-300 bg-white p-3">
@@ -3008,11 +3644,22 @@ export default function EventoDetailPage() {
                       />
                       <input
                         className="field text-sm"
-                        placeholder="Buscar cliente…"
+                        placeholder="Buscar cliente (nome ou WhatsApp)…"
                         value={orphanSearch}
                         onChange={(e) => setOrphanSearch(e.target.value)}
                       />
+                      {!orphanSearch.trim() ? (
+                        <p className="text-[11px] text-zinc-500">
+                          Digite nome ou telefone — lista inclui participantes
+                          deste leilão e o cadastro completo.
+                        </p>
+                      ) : null}
                       <ul className="max-h-36 space-y-1 overflow-y-auto">
+                        {filtered.length === 0 ? (
+                          <li className="px-2 py-1 text-xs text-zinc-500">
+                            Nenhum cliente encontrado com esse filtro.
+                          </li>
+                        ) : null}
                         {filtered.map((c) => (
                           <li key={c.id}>
                             <button
@@ -3038,6 +3685,40 @@ export default function EventoDetailPage() {
                           </li>
                         ))}
                       </ul>
+                      {!showOrphanNew ? (
+                        <button
+                          type="button"
+                          className="btn-secondary w-full text-xs"
+                          onClick={() => setShowOrphanNew(true)}
+                        >
+                          Cadastrar cliente novo e associar
+                        </button>
+                      ) : (
+                        <div className="space-y-1 rounded-md border border-zinc-200 bg-zinc-50 p-2">
+                          <input
+                            className="field text-sm"
+                            placeholder="Nome"
+                            value={orphanNewName}
+                            onChange={(e) => setOrphanNewName(e.target.value)}
+                          />
+                          <input
+                            className="field text-sm"
+                            placeholder="Telefone / WhatsApp (obrigatório)"
+                            value={orphanNewPhone}
+                            onChange={(e) => setOrphanNewPhone(e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn-primary w-full text-xs"
+                            disabled={busy}
+                            onClick={() =>
+                              void createCustomerAndAssignOrphan(line.id)
+                            }
+                          >
+                            Criar e associar
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })()
@@ -3055,7 +3736,8 @@ export default function EventoDetailPage() {
               <p className="mt-1 text-sm text-zinc-600">
                 Cada voto em Eu quero… conta 1 un. por padrão. Votos 💙 ficam na aba
                 retrátil e não entram neste resumo. Dá pra deixar várias cartas
-                abertas ao mesmo tempo.
+                abertas ao mesmo tempo. Marque a chegada por cliente quando as
+                levas forem parciais.
               </p>
             </div>
             <button
@@ -3084,11 +3766,20 @@ export default function EventoDetailPage() {
               const isAlreadyOnCard = (c: Customer) =>
                 alreadyIds.has(c.id) ||
                 alreadyPhones.has(customerPhoneDigits(c));
-              const q = voteSearch.trim().toLowerCase();
+              const q = voteSearch.trim();
               const eventCustomers = participants
                 .map((p) => {
                   if (!p.customer_id) return null;
-                  return customers.find((x) => x.id === p.customer_id) || null;
+                  const existing = customers.find((x) => x.id === p.customer_id);
+                  if (existing) return existing;
+                  return {
+                    id: p.customer_id,
+                    name: p.name,
+                    phone: p.phone,
+                    phone_digits: normalizePhoneDigits(p.phone),
+                    notes: "",
+                    created_at: "",
+                  } as Customer;
                 })
                 .filter(Boolean) as Customer[];
               const pool = q ? customers : eventCustomers;
@@ -3096,10 +3787,7 @@ export default function EventoDetailPage() {
                 .filter((c) => {
                   const already = isAlreadyOnCard(c);
                   if (already && !q) return false;
-                  if (!q) return true;
-                  const hay =
-                    `${c.name} ${c.phone} ${c.phone_digits || ""}`.toLowerCase();
-                  return hay.includes(q);
+                  return matchesCustomerQuery(c, q);
                 })
                 .slice(0, 30);
               return (
@@ -3144,20 +3832,10 @@ export default function EventoDetailPage() {
                       <span>
                         <span className="text-zinc-500">Un.</span> {row.ordered}
                       </span>
-                      <label className="flex items-center gap-1 text-xs text-zinc-600">
-                        Chegou
-                        <input
-                          className="field w-20 px-2 py-1"
-                          type="number"
-                          min={0}
-                          defaultValue={row.arrived}
-                          key={`${row.title}-${row.arrived}`}
-                          onBlur={(e) => {
-                            const v = Number(e.target.value);
-                            if (v !== row.arrived) void saveArrived(row.title, v);
-                          }}
-                        />
-                      </label>
+                      <span>
+                        <span className="text-zinc-500">Chegou</span>{" "}
+                        {row.arrived}/{row.ordered}
+                      </span>
                       {falta > 0 ? (
                         <Badge tone="warn">falta {falta}</Badge>
                       ) : (
@@ -3187,6 +3865,16 @@ export default function EventoDetailPage() {
                           const phone =
                             line.customers?.phone || line.phone_digits || "";
                           const canRemove = !line.paid && !line.garage_item_id;
+                          const lineQty =
+                            Number(line.qty) > 0 ? Number(line.qty) : 1;
+                          const lineArrived = Math.max(
+                            0,
+                            Math.min(
+                              lineQty,
+                              Number(line.qty_arrived) || 0,
+                            ),
+                          );
+                          const lineOk = lineArrived >= lineQty;
                           return (
                             <li
                               key={line.id}
@@ -3210,6 +3898,12 @@ export default function EventoDetailPage() {
                                     : line.charged
                                       ? "cobrado"
                                       : "em aberto"}
+                                  {" · "}
+                                  {lineOk
+                                    ? "chegou"
+                                    : lineArrived > 0
+                                      ? `parcial ${lineArrived}/${lineQty}`
+                                      : "ainda não chegou"}
                                 </div>
                               </div>
                               <div className="flex flex-wrap items-center gap-3">
@@ -3219,17 +3913,11 @@ export default function EventoDetailPage() {
                                     className="field w-16 px-2 py-1"
                                     type="number"
                                     min={1}
-                                    defaultValue={
-                                      Number(line.qty) > 0 ? Number(line.qty) : 1
-                                    }
+                                    defaultValue={lineQty}
                                     key={`${line.id}-sum-${line.qty}`}
                                     onBlur={(e) => {
                                       const v = Number(e.target.value);
-                                      const cur =
-                                        Number(line.qty) > 0
-                                          ? Number(line.qty)
-                                          : 1;
-                                      if (v !== cur) {
+                                      if (v !== lineQty) {
                                         void withScrollKeep(() =>
                                           updateLineQty(line.id, v),
                                         );
@@ -3237,6 +3925,48 @@ export default function EventoDetailPage() {
                                     }}
                                   />
                                 </label>
+                                {lineQty === 1 ? (
+                                  <label className="flex items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-700">
+                                    <input
+                                      type="checkbox"
+                                      checked={lineOk}
+                                      disabled={busy}
+                                      onChange={(e) =>
+                                        void withScrollKeep(() =>
+                                          setLineArrived(
+                                            line.id,
+                                            e.target.checked ? 1 : 0,
+                                          ),
+                                        )
+                                      }
+                                    />
+                                    Chegou
+                                  </label>
+                                ) : (
+                                  <label className="flex items-center gap-1 text-xs text-zinc-600">
+                                    Chegou
+                                    <input
+                                      className="field w-16 px-2 py-1"
+                                      type="number"
+                                      min={0}
+                                      max={lineQty}
+                                      defaultValue={lineArrived}
+                                      key={`${line.id}-arr-${lineArrived}`}
+                                      disabled={busy}
+                                      onBlur={(e) => {
+                                        const v = Number(e.target.value);
+                                        if (v !== lineArrived) {
+                                          void withScrollKeep(() =>
+                                            setLineArrived(line.id, v),
+                                          );
+                                        }
+                                      }}
+                                    />
+                                    <span className="text-zinc-400">
+                                      /{lineQty}
+                                    </span>
+                                  </label>
+                                )}
                                 {canRemove ? (
                                   <ConfirmButton
                                     label="Excluir"
@@ -3454,6 +4184,26 @@ export default function EventoDetailPage() {
             />
           ) : (
             <>
+              <div className="mb-3 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-2">
+                <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+                  Legenda do status
+                </p>
+                <ul className="flex flex-wrap gap-x-3 gap-y-1.5 text-xs text-zinc-700">
+                  {PARTICIPANT_FLOW_LEGEND.map((item) => (
+                    <li key={item.stage} className="inline-flex items-center gap-1.5">
+                      <span
+                        className={`inline-block h-2.5 w-2.5 rounded-sm ${item.swatch}`}
+                        aria-hidden
+                      />
+                      {item.label}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1.5 text-[11px] text-zinc-500">
+                  O estágio mais alto já conta os anteriores (separado = cobrado e
+                  pago). A cor da ficha é a carta mais atrasada da pessoa.
+                </p>
+              </div>
               <input
                 className="field mb-2 text-sm"
                 placeholder="Buscar participante (nome ou telefone)…"
@@ -3467,7 +4217,6 @@ export default function EventoDetailPage() {
                 </li>
               ) : null}
               {filteredParticipants.map((p) => {
-                const urgent = p.urgency === "overdue" || p.urgency === "warn";
                 const activeLines = p.lines.filter(
                   (l) => !isShelvedSaleLine(l, event.kind),
                 );
@@ -3475,17 +4224,17 @@ export default function EventoDetailPage() {
                 const missingPrice = activeLines.filter(
                   (l) => lineUnitPrice(l) == null,
                 ).length;
+                const flowStage = participantFlowStage(
+                  p.lines,
+                  event.kind,
+                  garageById,
+                );
+                const selected = selectedParticipant === p.key;
                 return (
                   <li key={p.key}>
                     <button
                       type="button"
-                      className={`flex w-full items-center justify-between rounded-md px-3 py-2.5 text-left text-sm ${
-                        selectedParticipant === p.key
-                          ? "bg-zinc-900 text-white"
-                          : urgent
-                            ? "bg-red-50 text-red-800 hover:bg-red-100"
-                            : "hover:bg-zinc-100"
-                      }`}
+                      className={`flex w-full items-center justify-between rounded-md px-3 py-2.5 text-left text-sm ${participantFlowCardClass(flowStage, selected)}`}
                       onClick={() => {
                         setSelectedParticipant(p.key);
                         setSelectedLineIds({});
@@ -3494,7 +4243,7 @@ export default function EventoDetailPage() {
                     >
                       <span className="font-medium">
                         {labelWithPhone(p.name, p.phone)}
-                        {missingPrice > 0 && selectedParticipant !== p.key ? (
+                        {missingPrice > 0 && !selected ? (
                           <span
                             className="ml-1 inline-block h-2 w-2 rounded-full bg-red-500"
                             title={`${missingPrice} sem valor`}
@@ -3597,6 +4346,15 @@ export default function EventoDetailPage() {
                 <button
                   type="button"
                   className="btn-secondary"
+                  disabled={selectedCount === 0 || busy}
+                  title="Cria cópia sem dono de cada selecionado (multi-unidade)"
+                  onClick={() => void duplicateSelectedLines()}
+                >
+                  Duplicar seleção
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
                   disabled={selectedCount === 0}
                   onClick={() =>
                     void markSeparated(selectedIdsFromParticipant(), true)
@@ -3617,7 +4375,7 @@ export default function EventoDetailPage() {
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={selectedCount === 0}
+                  disabled={selectedCount === 0 || busy}
                   onClick={() => void markPaid(selectedIdsFromParticipant(), true)}
                 >
                   Marcar pago
@@ -3626,7 +4384,7 @@ export default function EventoDetailPage() {
                   type="button"
                   className="btn-primary"
                   title={shipBlockedHint}
-                  disabled={!canMarkShipped}
+                  disabled={!canMarkShipped || busy}
                   onClick={() =>
                     void markShipped(selectedIdsFromParticipant())
                   }
@@ -3712,6 +4470,15 @@ export default function EventoDetailPage() {
                                   ? " · revisão"
                                   : ""}
                               </div>
+                              <button
+                                type="button"
+                                className="mt-1 text-xs font-medium text-sky-800 underline"
+                                disabled={busy}
+                                title="Cria outra unidade sem dono"
+                                onClick={() => void duplicateSaleLine(line)}
+                              >
+                                Duplicar
+                              </button>
                             </td>
                             <td>
                               <input
@@ -3753,9 +4520,10 @@ export default function EventoDetailPage() {
                                 <Badge
                                   tone={line.paid ? "good" : "bad"}
                                   title="Clique para inverter pagamento"
-                                  onClick={() =>
-                                    void markPaid([line.id], !line.paid)
-                                  }
+                                  onClick={() => {
+                                    if (busy) return;
+                                    void markPaid([line.id], !line.paid);
+                                  }}
                                 >
                                   {line.paid ? "Pago" : "Em aberto"}
                                 </Badge>
@@ -3901,6 +4669,11 @@ export default function EventoDetailPage() {
         <h2 className="sm:col-span-2 lg:col-span-6 font-semibold">
           Adicionar item manual (se a planilha não pegou / pedido extra no PV)
         </h2>
+        <p className="sm:col-span-2 lg:col-span-6 -mt-2 text-xs text-zinc-500">
+          Para multi-unidade (ex.: “2 unidades” com pessoas diferentes), use{" "}
+          <strong>Duplicar</strong> na carta e depois <strong>Trocar dono</strong>{" "}
+          na cópia — ou crie aqui do zero se faltar totalmente.
+        </p>
         <label className="text-sm lg:col-span-2">
           <span className="mb-1 block text-zinc-600">Cliente</span>
           <select

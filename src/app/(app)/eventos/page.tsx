@@ -6,6 +6,8 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
 import { createClient } from "@/lib/supabase/client";
+import { fetchAllQueryRows } from "@/lib/customers";
+import { eventHappenedAtIso, eventHappenedOn } from "@/lib/event-date";
 import { EVENT_STATUS_LABEL } from "@/lib/labels";
 import {
   isActiveBillableSaleLine,
@@ -31,23 +33,41 @@ export default function EventosPage() {
   const [name, setName] = useState("");
   const [kind, setKind] = useState<"leilao" | "encomenda" | "outro">("leilao");
   const [paymentDue, setPaymentDue] = useState("");
+  const [heldOn, setHeldOn] = useState("");
   const [ownerId, setOwnerId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [me, setMe] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    const [{ data: ev, error: e1 }, { data: pf, error: e2 }, { data: lines }, auth] =
+    const [{ data: ev, error: e1 }, { data: pf, error: e2 }, lines, auth] =
       await Promise.all([
         supabase
           .from("events")
           .select("*, profiles!owner_id(id, name, role, created_at)")
           .order("opened_at", { ascending: false }),
         supabase.from("profiles").select("*").order("name"),
-        supabase
-          .from("event_sale_lines")
-          .select(
-            "event_id, paid, cancelled, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
-          ),
+        fetchAllQueryRows<{
+          event_id: string;
+          paid: boolean;
+          cancelled: boolean;
+          archived: boolean | null;
+          import_status?: string;
+          certainty?: string;
+          phone_digits: string | null;
+          valor_ou_opcao: string | null;
+          notes: string | null;
+        }>((from, to) =>
+          supabase
+            .from("event_sale_lines")
+            .select(
+              "id, event_id, paid, cancelled, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
+            )
+            .order("id", { ascending: true })
+            .range(from, to),
+        ).catch((e) => {
+          console.error(e);
+          return [];
+        }),
         supabase.auth.getUser(),
       ]);
     if (e1) setError(e1.message);
@@ -59,7 +79,7 @@ export default function EventosPage() {
     for (const evRow of list) {
       unpaidByEvent.set(evRow.id, 0);
     }
-    for (const line of lines || []) {
+    for (const line of lines) {
       const id = line.event_id as string;
       const kind = kindById.get(id);
       if (!isActiveBillableSaleLine(line, kind)) continue;
@@ -98,6 +118,7 @@ export default function EventosPage() {
         notes: "",
         kind,
         payment_due_at: paymentDue || null,
+        opened_at: heldOn ? eventHappenedAtIso(heldOn) : undefined,
         use_stock_box: false,
       })
       .select("id")
@@ -108,6 +129,7 @@ export default function EventosPage() {
     }
     setName("");
     setPaymentDue("");
+    setHeldOn("");
     window.location.href = `/eventos/${data.id}`;
   }
 
@@ -124,7 +146,7 @@ export default function EventosPage() {
         </p>
       ) : null}
 
-      <form onSubmit={onCreate} className="panel mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <form onSubmit={onCreate} className="panel mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
         <label className="text-sm lg:col-span-2">
           <span className="mb-1 block text-zinc-600">Nome do evento</span>
           <input
@@ -132,7 +154,7 @@ export default function EventosPage() {
             required
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="Ex.: Leilão Especial Ago"
+            placeholder="Ex.: Leilão dia 30/08"
           />
         </label>
         <label className="text-sm">
@@ -146,6 +168,16 @@ export default function EventosPage() {
             <option value="encomenda">Encomendas</option>
             <option value="outro">Outro</option>
           </select>
+        </label>
+        <label className="text-sm">
+          <span className="mb-1 block text-zinc-600">Data do evento</span>
+          <input
+            className="field"
+            type="date"
+            required
+            value={heldOn}
+            onChange={(e) => setHeldOn(e.target.value)}
+          />
         </label>
         <label className="text-sm">
           <span className="mb-1 block text-zinc-600">Prazo de pagamento</span>
@@ -170,7 +202,7 @@ export default function EventosPage() {
             ))}
           </select>
         </label>
-        <div className="flex items-end lg:col-span-5">
+        <div className="flex items-end lg:col-span-6">
           <button type="submit" className="btn-primary">
             Abrir evento
           </button>
@@ -185,6 +217,7 @@ export default function EventosPage() {
             <thead>
               <tr>
                 <th>Evento</th>
+                <th>Dia</th>
                 <th>Status</th>
                 <th>Prazo</th>
                 <th>Responsável</th>
@@ -201,6 +234,17 @@ export default function EventosPage() {
                         {ev.unpaidUrgent} pagamento(s) em aberto no prazo
                       </span>
                     ) : null}
+                  </td>
+                  <td className="whitespace-nowrap text-sm text-zinc-700">
+                    {(() => {
+                      const day = eventHappenedOn({
+                        name: ev.name,
+                        opened_at: ev.opened_at,
+                      });
+                      return day
+                        ? new Date(`${day}T12:00:00`).toLocaleDateString("pt-BR")
+                        : "—";
+                    })()}
                   </td>
                   <td>
                     <Badge tone={statusTone(ev.status)}>

@@ -41,7 +41,10 @@ export async function updateSession(request: NextRequest) {
   const isLogin = path === "/login";
   const isSetup = path === "/setup";
   const isHome = path === "/";
-  const isPublic = isLogin || isSetup || isHome;
+  // APIs com auth própria (chave do bot / fluxo de signup)
+  const isOpenApi =
+    path.startsWith("/api/bot/") || path.startsWith("/api/auth/");
+  const isPublic = isLogin || isSetup || isHome || isOpenApi;
 
   if (!user && !isPublic) {
     const redirect = request.nextUrl.clone();

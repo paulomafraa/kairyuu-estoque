@@ -50,6 +50,7 @@ export type GarageItem = {
   event_name: string;
   event_date: string | null;
   event_id?: string | null;
+  event_sale_line_id?: string | null;
   shipment_id?: string | null;
   shipped_on?: string | null;
   unit_price: number | null;
@@ -157,6 +158,8 @@ export type EventSaleLine = {
   valor_ou_opcao: string;
   unit_price: number | null;
   qty: number;
+  /** Unidades que já chegaram desta linha (encomenda, levas parciais). */
+  qty_arrived?: number;
   import_status:
     | "arrematado"
     | "lance"
