@@ -243,36 +243,23 @@ export async function fetchSaleLinesForCustomer<T extends { id: string }>(
   const select = opts.select || "*";
   const ids = opts.customerIds.filter(Boolean);
   const variants = phoneVariants(opts.phoneDigits || "");
+  const filters: string[] = [];
+  if (ids.length) filters.push(`customer_id.in.(${ids.join(",")})`);
+  if (variants.length) filters.push(`phone_digits.in.(${variants.join(",")})`);
+  if (!filters.length) return [];
+
   const applyCancelled = (q: ReturnType<DbClient["from"]>) =>
     opts.cancelled === false ? q.eq("cancelled", false) : q;
 
-  const byId = ids.length
-    ? await fetchAllQueryRows<T>((from, to) =>
-        applyCancelled(
-          supabase
-            .from("event_sale_lines")
-            .select(select)
-            .in("customer_id", ids)
-            .order("created_at", { ascending: false }),
-        ).range(from, to),
-      )
-    : [];
-
-  const byPhone = variants.length
-    ? await fetchAllQueryRows<T>((from, to) =>
-        applyCancelled(
-          supabase
-            .from("event_sale_lines")
-            .select(select)
-            .in("phone_digits", variants)
-            .order("created_at", { ascending: false }),
-        ).range(from, to),
-      )
-    : [];
-
-  const map = new Map<string, T>();
-  for (const row of [...byId, ...byPhone]) map.set(row.id, row);
-  return [...map.values()];
+  return fetchAllQueryRows<T>((from, to) =>
+    applyCancelled(
+      supabase
+        .from("event_sale_lines")
+        .select(select)
+        .or(filters.join(","))
+        .order("created_at", { ascending: false }),
+    ).range(from, to),
+  );
 }
 
 /**

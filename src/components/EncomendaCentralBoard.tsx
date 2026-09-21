@@ -104,31 +104,44 @@ export function EncomendaCentralBoard() {
     const auth = await supabase.auth.getUser();
     setMeId(auth.data.user?.id ?? null);
 
-    const [ev, ln, st] = await Promise.all([
+    const [ev, st] = await Promise.all([
       supabase
         .from("events")
         .select("*")
         .eq("kind", "encomenda")
         .order("opened_at", { ascending: false }),
-      (async () => {
-        try {
-          const rows = await fetchAllQueryRows<EventSaleLine>((from, to) =>
+      supabase.from("event_product_stock").select("*"),
+    ]);
+
+    const eventList = (ev.data as Event[]) || [];
+    const eventIds = eventList.map((e) => e.id);
+    let ln: {
+      data: EventSaleLine[] | null;
+      error: { message: string } | null;
+    } = { data: [], error: null };
+    if (eventIds.length) {
+      try {
+        const rows: EventSaleLine[] = [];
+        for (let i = 0; i < eventIds.length; i += 80) {
+          const chunk = eventIds.slice(i, i + 80);
+          const part = await fetchAllQueryRows<EventSaleLine>((from, to) =>
             supabase
               .from("event_sale_lines")
               .select("*, customers(id, name, phone)")
+              .in("event_id", chunk)
               .order("created_at", { ascending: true })
               .range(from, to),
           );
-          return { data: rows, error: null as { message: string } | null };
-        } catch (e) {
-          return {
-            data: null as EventSaleLine[] | null,
-            error: { message: e instanceof Error ? e.message : String(e) },
-          };
+          rows.push(...part);
         }
-      })(),
-      supabase.from("event_product_stock").select("*"),
-    ]);
+        ln = { data: rows, error: null };
+      } catch (e) {
+        ln = {
+          data: null,
+          error: { message: e instanceof Error ? e.message : String(e) },
+        };
+      }
+    }
 
     if (ev.error) setError(ev.error.message);
     if (ln.error) setError(ln.error.message);
@@ -136,11 +149,7 @@ export function EncomendaCentralBoard() {
       setError(st.error.message);
     }
 
-    const eventList = (ev.data as Event[]) || [];
-    const eventIds = new Set(eventList.map((e) => e.id));
-    const saleLines = ((ln.data as EventSaleLine[]) || []).filter((l) =>
-      eventIds.has(l.event_id),
-    );
+    const saleLines = (ln.data as EventSaleLine[]) || [];
     setEvents(eventList);
     setLines(saleLines);
     setStock((st.data as EventProductStock[]) || []);

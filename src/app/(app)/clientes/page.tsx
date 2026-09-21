@@ -95,7 +95,8 @@ export default function ClientesPage() {
     const [
       { data: items },
       { data: orders },
-      saleLines,
+      unpaidLines,
+      saleCustomerIds,
       { data: events },
       { data: garage },
       { data: groupActivity, error: groupErr },
@@ -121,6 +122,20 @@ export default function ClientesPage() {
           .select(
             "id, customer_id, paid, cancelled, charged, separated, event_id, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
           )
+          .eq("cancelled", false)
+          .eq("paid", false)
+          .order("id", { ascending: true })
+          .range(from, to),
+      ).catch((e) => {
+        console.error(e);
+        return [];
+      }),
+      fetchAllQueryRows<{ id: string; customer_id: string }>((from, to) =>
+        supabase
+          .from("event_sale_lines")
+          .select("id, customer_id")
+          .eq("cancelled", false)
+          .not("customer_id", "is", null)
           .order("id", { ascending: true })
           .range(from, to),
       ).catch((e) => {
@@ -183,8 +198,8 @@ export default function ClientesPage() {
     const activeIds = new Set<string>();
     for (const row of items || []) activeIds.add(row.customer_id);
     for (const row of orders || []) activeIds.add(row.customer_id);
-    for (const row of saleLines || []) {
-      if (row.customer_id) activeIds.add(row.customer_id as string);
+    for (const row of saleCustomerIds || []) {
+      if (row.customer_id) activeIds.add(row.customer_id);
     }
     for (const row of garage || []) activeIds.add(row.customer_id as string);
 
@@ -196,7 +211,7 @@ export default function ClientesPage() {
       pendByCustomer.set(id, cur);
     };
 
-    for (const line of saleLines || []) {
+    for (const line of unpaidLines || []) {
       if (!line.customer_id || line.paid) continue;
       const kind = kindByEvent.get(line.event_id as string);
       if (!isActiveBillableSaleLine(line, kind)) continue;

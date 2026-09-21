@@ -320,7 +320,12 @@ export default function EventoDetailPage() {
       setMeName(profile?.name || auth.data.user?.email || "Staff");
     }
 
-    const [ev, ln, cuRows, al, cd, ps, costs] = await Promise.all([
+    const customersPromise = fetchAllCustomers(supabase).catch((e) => {
+      console.error(e);
+      return [] as Customer[];
+    });
+
+    const [ev, ln, al, cd, ps, costs] = await Promise.all([
       supabase
         .from("events")
         .select("*, profiles!owner_id(id, name, role, created_at)")
@@ -344,10 +349,6 @@ export default function EventoDetailPage() {
           };
         }
       })(),
-      fetchAllCustomers(supabase).catch((e) => {
-        console.error(e);
-        return [] as Customer[];
-      }),
       supabase
         .from("event_allocations")
         .select("*, cards(*)")
@@ -410,7 +411,6 @@ export default function EventoDetailPage() {
       setProductStock((ps.data as EventProductStock[]) || []);
     }
 
-    setCustomers(cuRows);
     if (!al.error) setAllocations((al.data as EventAllocation[]) || []);
     setCards((cd.data as Card[]) || []);
     if (costs.error) {
@@ -421,6 +421,7 @@ export default function EventoDetailPage() {
     } else {
       setProductCosts((costs.data as EventProductCost[]) || []);
     }
+    setCustomers(await customersPromise);
   }, [supabase, eventId]);
 
   useEffect(() => {

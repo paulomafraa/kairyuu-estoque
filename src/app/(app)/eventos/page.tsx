@@ -62,6 +62,8 @@ export default function EventosPage() {
             .select(
               "id, event_id, paid, cancelled, archived, import_status, certainty, phone_digits, valor_ou_opcao, notes",
             )
+            .eq("cancelled", false)
+            .eq("paid", false)
             .order("id", { ascending: true })
             .range(from, to),
         ).catch((e) => {
@@ -99,8 +101,8 @@ export default function EventosPage() {
     );
     setProfiles((pf as Profile[]) || []);
     setMe(auth.data.user?.id ?? null);
-    if (!ownerId && auth.data.user?.id) setOwnerId(auth.data.user.id);
-  }, [supabase, ownerId]);
+    setOwnerId((prev) => prev || auth.data.user?.id || "");
+  }, [supabase]);
 
   useEffect(() => {
     void load();

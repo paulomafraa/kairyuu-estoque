@@ -18,8 +18,6 @@ import { normalizePhoneDigits } from "@/lib/clients-csv";
 import {
   fetchCustomersSharingPhone,
   fetchSaleLinesForCustomer,
-  pickCanonicalCustomerId,
-  relinkSaleLinesToCanonicalCustomer,
 } from "@/lib/customers";
 import {
   buildBillingMessage,
@@ -208,12 +206,8 @@ export default function ClienteDetailPage() {
         phoneDigits,
       );
       relatedIds = [...new Set([customerId, ...sharing.map((c) => c.id)])];
-      const canonicalId = pickCanonicalCustomerId(sharing, customerId);
-      await relinkSaleLinesToCanonicalCustomer(supabase, {
-        canonicalId,
-        relatedIds,
-        phoneDigits,
-      });
+      // Só preenche customer_id nulo. Não reescreve linhas a cada visita —
+      // isso travava o banco quando a staff abria várias fichas.
     } catch (e) {
       console.warn("Não foi possível unificar duplicatas do cliente:", e);
     }
