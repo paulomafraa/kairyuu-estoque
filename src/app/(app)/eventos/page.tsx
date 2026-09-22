@@ -9,6 +9,12 @@ import { createClient } from "@/lib/supabase/client";
 import { fetchAllQueryRows } from "@/lib/customers";
 import { eventHappenedAtIso, eventHappenedOn } from "@/lib/event-date";
 import { EVENT_STATUS_LABEL } from "@/lib/labels";
+import { TypeToConfirmDialog } from "@/components/TypeToConfirmDialog";
+import {
+  restoreEventRoundBackup,
+  type EventRoundBackup,
+} from "@/lib/event-backup";
+import { logStaffAction } from "@/lib/audit";
 import {
   isActiveBillableSaleLine,
   paymentUrgency,
@@ -36,7 +42,12 @@ export default function EventosPage() {
   const [heldOn, setHeldOn] = useState("");
   const [ownerId, setOwnerId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [me, setMe] = useState<string | null>(null);
+  const [backups, setBackups] = useState<EventRoundBackup[]>([]);
+  const [restoreTarget, setRestoreTarget] = useState<EventRoundBackup | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     const [{ data: ev, error: e1 }, { data: pf, error: e2 }, lines, auth] =
@@ -102,11 +113,70 @@ export default function EventosPage() {
     setProfiles((pf as Profile[]) || []);
     setMe(auth.data.user?.id ?? null);
     setOwnerId((prev) => prev || auth.data.user?.id || "");
+
+    const { data: bk, error: bkErr } = await supabase
+      .from("event_round_backups")
+      .select(
+        "id, original_event_id, event_name, event_kind, opened_at, deleted_at, deleted_by",
+      )
+      .order("deleted_at", { ascending: false })
+      .limit(80);
+    if (bkErr) {
+      if (!/does not exist|schema cache/i.test(bkErr.message)) {
+        setError(bkErr.message);
+      }
+      setBackups([]);
+    } else {
+      setBackups((bk as EventRoundBackup[]) || []);
+    }
   }, [supabase]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get("apagado") === "1") {
+      setInfo(
+        "Evento excluído. O backup permanente da rodada está na lista abaixo — não pode ser apagado.",
+      );
+    }
+  }, []);
+
+  async function restoreConfirmed() {
+    if (!restoreTarget) return;
+    setRestoreBusy(true);
+    setRestoreError(null);
+    try {
+      const { data: full, error: fullErr } = await supabase
+        .from("event_round_backups")
+        .select("*")
+        .eq("id", restoreTarget.id)
+        .single();
+      if (fullErr || !full) {
+        throw new Error(fullErr?.message || "Backup não encontrado.");
+      }
+      const id = await restoreEventRoundBackup(
+        supabase,
+        full as EventRoundBackup,
+      );
+      await logStaffAction(supabase, {
+        action: "restore_event",
+        detail: `Restaurou a rodada “${restoreTarget.event_name}” a partir do backup ${restoreTarget.id}`,
+        created_by: me,
+        entity_type: "event",
+        entity_id: id,
+        event_id: id,
+      });
+      setRestoreTarget(null);
+      window.location.href = `/eventos/${id}`;
+    } catch (e) {
+      setRestoreError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestoreBusy(false);
+    }
+  }
 
   async function onCreate(e: FormEvent) {
     e.preventDefault();
@@ -145,6 +215,11 @@ export default function EventosPage() {
       {error ? (
         <p className="mb-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800">
           {error}
+        </p>
+      ) : null}
+      {info ? (
+        <p className="mb-4 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          {info}
         </p>
       ) : null}
 
@@ -275,6 +350,98 @@ export default function EventosPage() {
           </table>
         </div>
       )}
+
+      <section className="panel mt-8">
+        <h2 className="mb-1 text-base font-semibold text-zinc-900">
+          Backups de rodadas excluídas
+        </h2>
+        <p className="mb-4 text-sm text-zinc-600">
+          Cada exclusão grava um backup permanente. Ele não pode ser apagado.
+          Restaurar recria o evento com as cartas e cobranças da época.
+        </p>
+        {backups.length === 0 ? (
+          <p className="text-sm text-zinc-500">Nenhum backup ainda.</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>Rodada</th>
+                  <th>Tipo</th>
+                  <th>Dia do evento</th>
+                  <th>Excluído em</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {backups.map((b) => {
+                  const day = eventHappenedOn({
+                    name: b.event_name,
+                    opened_at: b.opened_at,
+                  });
+                  const alreadyLive = events.some(
+                    (e) => e.id === b.original_event_id,
+                  );
+                  return (
+                    <tr key={b.id}>
+                      <td className="font-medium">{b.event_name}</td>
+                      <td className="text-sm text-zinc-600">{b.event_kind}</td>
+                      <td className="whitespace-nowrap text-sm">
+                        {day
+                          ? new Date(`${day}T12:00:00`).toLocaleDateString(
+                              "pt-BR",
+                            )
+                          : "—"}
+                      </td>
+                      <td className="whitespace-nowrap text-sm text-zinc-600">
+                        {new Date(b.deleted_at).toLocaleString("pt-BR")}
+                      </td>
+                      <td>
+                        {alreadyLive ? (
+                          <Link
+                            className="btn-secondary"
+                            href={`/eventos/${b.original_event_id}`}
+                          >
+                            Já restaurado
+                          </Link>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={() => {
+                              setRestoreError(null);
+                              setRestoreTarget(b);
+                            }}
+                          >
+                            Restaurar
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <TypeToConfirmDialog
+        open={Boolean(restoreTarget)}
+        title="Restaurar esta rodada?"
+        warning={
+          restoreTarget
+            ? `Vai recriar o evento “${restoreTarget.event_name}” com as cartas e cobranças do backup.\n\nO backup continua salvo (não dá para excluir).`
+            : ""
+        }
+        confirmLabel="Restaurar rodada"
+        busy={restoreBusy}
+        error={restoreError}
+        onCancel={() => {
+          if (!restoreBusy) setRestoreTarget(null);
+        }}
+        onConfirm={() => void restoreConfirmed()}
+      />
     </div>
   );
 }

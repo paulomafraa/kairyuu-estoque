@@ -9,11 +9,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/Badge";
 import { EmptyState } from "@/components/EmptyState";
 import { ConfirmButton } from "@/components/ConfirmButton";
+import { TypeToConfirmDialog } from "@/components/TypeToConfirmDialog";
+import { deleteEventKeepingBackup } from "@/lib/event-backup";
 import { EventResumoPanel } from "@/components/EventResumoPanel";
 import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
@@ -208,8 +210,12 @@ function lineUnitPrice(line: EventSaleLine): number | null {
 
 export default function EventoDetailPage() {
   const params = useParams<{ id: string }>();
+  const router = useRouter();
   const eventId = params.id;
   const supabase = useMemo(() => createClient(), []);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const [event, setEvent] = useState<(Event & { profiles?: Profile | null }) | null>(null);
   const [lines, setLines] = useState<EventSaleLine[]>([]);
@@ -829,6 +835,31 @@ export default function EventoDetailPage() {
     else {
       setInfo("Datas do evento atualizadas.");
       await load();
+    }
+  }
+
+  async function deleteEventConfirmed() {
+    if (!event) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      const backup = await deleteEventKeepingBackup(supabase, {
+        event,
+        deletedBy: meId,
+      });
+      await logStaffAction(supabase, {
+        action: "delete_event",
+        detail: `${meName} excluiu o evento “${event.name}” · backup ${backup.id} · ${lines.length} linha(s)`,
+        created_by: meId,
+        entity_type: "event",
+        entity_id: event.id,
+        event_id: null,
+      });
+      router.push("/eventos?apagado=1");
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleteBusy(false);
     }
   }
 
@@ -2667,8 +2698,30 @@ export default function EventoDetailPage() {
             <Link href="/eventos" className="btn-secondary">
               Voltar
             </Link>
+            <button
+              type="button"
+              className="rounded-md border border-red-300 bg-red-50 px-3 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100"
+              onClick={() => {
+                setDeleteError(null);
+                setShowDeleteConfirm(true);
+              }}
+            >
+              Excluir evento
+            </button>
           </div>
         }
+      />
+      <TypeToConfirmDialog
+        open={showDeleteConfirm}
+        title="Excluir este evento?"
+        warning={`Isso apaga a rodada “${event.name}” da operação (cartas, cobranças e estoque do evento).\n\nA caixinha dos clientes permanece. Antes de apagar, um backup permanente da rodada é gravado — esse backup não pode ser excluído e dá para restaurar depois em Eventos.`}
+        confirmLabel="Excluir evento"
+        busy={deleteBusy}
+        error={deleteError}
+        onCancel={() => {
+          if (!deleteBusy) setShowDeleteConfirm(false);
+        }}
+        onConfirm={() => void deleteEventConfirmed()}
       />
 
       {error ? (
