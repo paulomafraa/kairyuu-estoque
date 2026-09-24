@@ -36,6 +36,8 @@ export type EventResumo = {
   unpaidLines: number;
   missingPrice: number;
   salesTotal: number;
+  paidTotal: number;
+  unpaidTotal: number;
   byCustomer: CustomerSalesRow[];
   topByValue: CustomerSalesRow[];
   topByItems: CustomerSalesRow[];
@@ -47,6 +49,9 @@ export type EventResumo = {
     totalJpTax: number;
     totalSaleMatched: number;
     totalProfit: number;
+    faturamento: number;
+    gasto: number;
+    lucro: number;
     rows: Array<{
       product_title: string;
       qty: number;
@@ -75,6 +80,8 @@ export function buildEventResumo(
   );
   const cancelledLines = lines.filter((l) => l.cancelled).length;
   let salesTotal = 0;
+  let paidTotal = 0;
+  let unpaidTotal = 0;
   let missingPrice = 0;
   let paidLines = 0;
   let unpaidLines = 0;
@@ -87,7 +94,12 @@ export function buildEventResumo(
     if (l.paid) paidLines += 1;
     else unpaidLines += 1;
     if (price == null) missingPrice += 1;
-    else salesTotal += price * qty;
+    else {
+      const lineTotal = price * qty;
+      salesTotal += lineTotal;
+      if (l.paid) paidTotal += lineTotal;
+      else unpaidTotal += lineTotal;
+    }
 
     if (!l.customer_id && !l.phone && !l.customer_name) continue;
     const key = l.customer_id || l.phone || l.customer_name;
@@ -155,10 +167,18 @@ export function buildEventResumo(
       const tax = costWithTax(jp);
       const saleUnit = c.price_sale;
       const saleTotal =
-        saleUnit != null ? saleUnit * bucket.qty : bucket.saleSum || null;
-      const profitUnit = estimatedProfit(saleUnit, jp);
-      const profit =
-        profitUnit != null ? Math.round(profitUnit * bucket.qty * 100) / 100 : null;
+        bucket.saleSum > 0
+          ? bucket.saleSum
+          : saleUnit != null
+            ? saleUnit * bucket.qty
+            : null;
+      let profit: number | null = null;
+      if (saleTotal != null && tax != null) {
+        profit = Math.round((saleTotal - tax * bucket.qty) * 100) / 100;
+      } else {
+        const unit = estimatedProfit(saleUnit, jp);
+        if (unit != null) profit = Math.round(unit * bucket.qty * 100) / 100;
+      }
       if (jp != null) totalJp += jp * bucket.qty;
       if (tax != null) totalJpTax += tax * bucket.qty;
       if (saleTotal != null) totalSaleMatched += saleTotal;
@@ -173,13 +193,18 @@ export function buildEventResumo(
       });
     }
     rows.sort((a, b) => a.product_title.localeCompare(b.product_title, "pt-BR"));
+    const gasto = Math.round(totalJpTax * 100) / 100;
+    const faturamento = Math.round(totalSaleMatched * 100) / 100;
     cost = {
       matched,
       unmatchedSales,
       totalJp: Math.round(totalJp * 100) / 100,
-      totalJpTax: Math.round(totalJpTax * 100) / 100,
-      totalSaleMatched: Math.round(totalSaleMatched * 100) / 100,
+      totalJpTax: gasto,
+      totalSaleMatched: faturamento,
       totalProfit: Math.round(totalProfit * 100) / 100,
+      faturamento,
+      gasto,
+      lucro: Math.round(totalProfit * 100) / 100,
       rows,
     };
   }
@@ -191,6 +216,8 @@ export function buildEventResumo(
     unpaidLines,
     missingPrice,
     salesTotal: Math.round(salesTotal * 100) / 100,
+    paidTotal: Math.round(paidTotal * 100) / 100,
+    unpaidTotal: Math.round(unpaidTotal * 100) / 100,
     byCustomer,
     topByValue: byCustomer.slice(0, 10),
     topByItems: [...byCustomer].sort((a, b) => b.items - a.items).slice(0, 10),

@@ -6,6 +6,7 @@ export type EncomendaCostRow = {
   price_sale: number | null;
   price_liga: number | null;
   link: string;
+  sort_index?: number;
 };
 
 /** Normaliza texto solto (acentos / espaços). */
@@ -154,4 +155,131 @@ export function estimatedProfit(
   const taxed = costWithTax(costJp);
   if (taxed == null) return null;
   return Math.round((sale - taxed) * 100) / 100;
+}
+
+function sheetDdMm(name: string): string | null {
+  const m =
+    name.match(/(\d{2})(\d{2})\s*$/) || name.match(/(\d{2})(\d{2})(?:\s|$)/);
+  if (!m) return null;
+  const dd = Number(m[1]);
+  const mm = Number(m[2]);
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+  return `${m[1]}${m[2]}`;
+}
+
+/** YYYY-MM-DD → DDMM da aba (ex.: 2026-08-26 → 2608). */
+export function eventDateToSheetDdmm(ymd: string | null | undefined): string | null {
+  const day = (ymd || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  return `${day.slice(8, 10)}${day.slice(5, 7)}`;
+}
+
+function isRoundSheetName(name: string): boolean {
+  const n = name.trim();
+  if (!n) return false;
+  if (
+    /^(TUDO JUNTO|30 ANOS|Old orders|Cópia de Old orders)$/i.test(n) ||
+    /^c[oó]pia de/i.test(n)
+  ) {
+    return false;
+  }
+  if (/^Encomendas/i.test(n)) return true;
+  return /[-–]\s*\d{4}\s*$/.test(n) && Boolean(sheetDdMm(n));
+}
+
+export function looksLikeEncomendaCostWorkbook(sheetNames: string[]): boolean {
+  return sheetNames.some(isRoundSheetName);
+}
+
+export type EncomendaXlsxParse = {
+  rows: EncomendaCostRow[];
+  sheetUsed: string;
+  sheets: string[];
+};
+
+function parseSheetMatrix(matrix: unknown[][]): EncomendaCostRow[] {
+  const out: EncomendaCostRow[] = [];
+  let started = false;
+  let sort = 0;
+  for (let r = 0; r < matrix.length; r++) {
+    const line = (matrix[r] || []).map((c) => String(c ?? "").trim());
+    const nome = (line[0] || "").replace(/\s+/g, " ").trim();
+    if (!nome) continue;
+    if (/^carta$/i.test(nome)) {
+      if (started) break;
+      started = true;
+      continue;
+    }
+    started = true;
+    const cost_jp = parseMoneyCell(line[1] || "");
+    const price_sale = parseMoneyCell(line[2] || "");
+    const price_liga = parseMoneyCell(line[3] || "");
+    const link = (line[4] || "").trim();
+    if (price_sale == null && cost_jp == null && !link) continue;
+    sort += 1;
+    out.push({
+      product_title: nome,
+      cost_jp,
+      price_sale,
+      price_liga,
+      link,
+      sort_index: sort,
+    });
+  }
+  return out;
+}
+
+function scoreRoundSheet(
+  name: string,
+  rowCount: number,
+  hintDdmm: string | null,
+): number {
+  const ddmm = sheetDdMm(name);
+  let score = rowCount;
+  if (hintDdmm && ddmm === hintDdmm) score += 10000;
+  if (ddmm) score += Number(ddmm);
+  return score;
+}
+
+/** Lê Encomendas.xlsx (abas `Encomendas - 2608`) e escolhe a aba da data do evento. */
+export async function parseEncomendaXlsx(
+  file: File,
+  eventYmd?: string | null,
+): Promise<EncomendaXlsxParse> {
+  const XLSX = await import("xlsx");
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array" });
+  const rounds = wb.SheetNames.filter(isRoundSheetName);
+  const sheets = rounds.length ? rounds : wb.SheetNames;
+  if (!sheets.length) {
+    return { rows: [], sheetUsed: "", sheets: [] };
+  }
+
+  const hint = eventDateToSheetDdmm(eventYmd);
+  let best = sheets[0];
+  let bestScore = -1;
+  for (const name of sheets) {
+    const sheet = wb.Sheets[name];
+    const matrix = (XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      defval: "",
+      raw: false,
+    }) || []) as unknown[][];
+    const score = scoreRoundSheet(name, matrix.length, hint);
+    if (score > bestScore) {
+      bestScore = score;
+      best = name;
+    }
+  }
+
+  const matrix = (XLSX.utils.sheet_to_json(wb.Sheets[best], {
+    header: 1,
+    defval: "",
+    raw: false,
+  }) || []) as unknown[][];
+  return {
+    rows: parseSheetMatrix(matrix),
+    sheetUsed: best,
+    sheets,
+  };
 }

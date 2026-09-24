@@ -46,13 +46,22 @@ import {
 } from "@/lib/leilao-resultado";
 import {
   buildBillingMessage,
+  buildEncomendaPedidoMessages,
   greetingName,
 } from "@/lib/cobranca-msg";
 import {
+  looksLikeEncomendaCostWorkbook,
   parseEncomendaTemplateCsv,
+  parseEncomendaXlsx,
+  productMatchKey,
   type EncomendaCostRow,
 } from "@/lib/encomenda-template";
 import { buildEventResumo } from "@/lib/evento-resumo";
+import {
+  cardSortMs,
+  compareByCardSort,
+  type CardSortMode,
+} from "@/lib/card-sort";
 import {
   buildResultadoCsv,
   downloadTextFile,
@@ -297,6 +306,7 @@ export default function EventoDetailPage() {
   const [reassignNewPhone, setReassignNewPhone] = useState("");
 
   const [productCosts, setProductCosts] = useState<EventProductCost[]>([]);
+  const [cardSort, setCardSort] = useState<CardSortMode>("enquete");
   const [controlReason, setControlReason] = useState("");
   const [orphanLineId, setOrphanLineId] = useState<string | null>(null);
   const [orphanSearch, setOrphanSearch] = useState("");
@@ -613,6 +623,24 @@ export default function EventoDetailPage() {
   const allActiveSelected =
     activeMainLines.length > 0 && selectedCount === activeMainLines.length;
 
+  const costIndex = useMemo(() => {
+    const map = new Map<string, EventProductCost>();
+    for (const c of productCosts) {
+      const key = productMatchKey(c.product_title);
+      if (key) map.set(key, c);
+    }
+    return map;
+  }, [productCosts]);
+
+  function lineCardSortMs(line: EventSaleLine): number {
+    const cost = costIndex.get(productMatchKey(line.product_title));
+    return cardSortMs({
+      pollCreatedAt: line.poll_created_at,
+      sortIndex: cost?.sort_index,
+      createdAt: line.created_at,
+    });
+  }
+
   const productSummary = useMemo(() => {
     const pedidoMap = new Map(
       productStock.map((s) => [s.product_title, Boolean(s.pedido_feito)] as const),
@@ -672,10 +700,12 @@ export default function EventoDetailPage() {
         return na.localeCompare(nb, "pt-BR");
       });
     }
-    return [...map.values()].sort((a, b) =>
-      a.title.localeCompare(b.title, "pt-BR"),
-    );
-  }, [lines, productStock, event?.kind]);
+    return [...map.values()].sort((a, b) => {
+      const aMs = Math.min(...a.lines.map((l) => lineCardSortMs(l)));
+      const bMs = Math.min(...b.lines.map((l) => lineCardSortMs(l)));
+      return compareByCardSort(a.title, aMs, b.title, bMs, cardSort);
+    });
+  }, [lines, productStock, event?.kind, cardSort, costIndex]);
 
   const leilaoBuckets = useMemo(() => {
     if (event?.kind !== "leilao") {
@@ -691,13 +721,19 @@ export default function EventoDetailPage() {
       else if (bucket === "review") review.push(line);
       else certain.push(line);
     }
-    const byTitle = (a: EventSaleLine, b: EventSaleLine) =>
-      a.product_title.localeCompare(b.product_title, "pt-BR");
-    certain.sort(byTitle);
-    review.sort(byTitle);
-    noVotes.sort(byTitle);
+    const byCard = (a: EventSaleLine, b: EventSaleLine) =>
+      compareByCardSort(
+        a.product_title,
+        lineCardSortMs(a),
+        b.product_title,
+        lineCardSortMs(b),
+        cardSort,
+      );
+    certain.sort(byCard);
+    review.sort(byCard);
+    noVotes.sort(byCard);
     return { certain, review, noVotes };
-  }, [lines, event?.kind]);
+  }, [lines, event?.kind, cardSort, costIndex]);
 
   const eventResumo = useMemo(() => {
     const costRows: EncomendaCostRow[] = productCosts.map((c) => ({
@@ -706,6 +742,7 @@ export default function EventoDetailPage() {
       price_sale: c.price_sale != null ? Number(c.price_sale) : null,
       price_liga: c.price_liga != null ? Number(c.price_liga) : null,
       link: c.link || "",
+      sort_index: c.sort_index ?? undefined,
     }));
     return buildEventResumo(
       lines.map((l) => ({
@@ -729,6 +766,17 @@ export default function EventoDetailPage() {
       event?.kind === "encomenda" ? costRows : undefined,
     );
   }, [lines, productCosts, event?.kind]);
+
+  const pedidoMsgs = useMemo(() => {
+    if (event?.kind !== "encomenda") return { pt: "", ja: "" };
+    return buildEncomendaPedidoMessages({
+      eventDate: eventHappenedOn({
+        name: event.name,
+        opened_at: event.opened_at,
+      }),
+      items: productSummary.map((r) => ({ title: r.title, qty: r.ordered })),
+    });
+  }, [event, productSummary]);
 
   const filteredCertain = useMemo(() => {
     const q = certainSearch.trim().toLowerCase();
@@ -864,6 +912,21 @@ export default function EventoDetailPage() {
   }
 
   async function onPickFile(file: File) {
+    if (event?.kind === "encomenda" && /\.xlsx?$/i.test(file.name)) {
+      try {
+        const XLSX = await import("xlsx");
+        const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+        const hasResultado = wb.SheetNames.some((s) =>
+          /resultado/i.test(s),
+        );
+        if (!hasResultado && looksLikeEncomendaCostWorkbook(wb.SheetNames)) {
+          await uploadEncomendaTemplate(file);
+          return;
+        }
+      } catch {
+        // segue como planilha de resultado
+      }
+    }
     setBusy(true);
     setError(null);
     try {
@@ -881,12 +944,13 @@ export default function EventoDetailPage() {
         parsed.noVotes,
         kind,
       );
-      // Leilão: revisão e sem votos vêm por padrão
+      // Leilão: revisão e sem votos vêm por padrão.
+      // Encomenda: revisão ❓ também (o bot grava clique sem opção lida).
       if (kind === "leilao") {
         setIncludeReview(true);
         setIncludeNoVotes(true);
       } else {
-        setIncludeReview(false);
+        setIncludeReview(review.length > 0);
         setIncludeNoVotes(false);
       }
       setImportPreview({
@@ -922,6 +986,18 @@ export default function EventoDetailPage() {
       const existing = phoneToCustomer.get(line.phone_digits);
       return existing?.id ?? null;
     }
+  }
+
+  async function insertSaleLineChunk(chunk: Record<string, unknown>[]) {
+    const first = await supabase.from("event_sale_lines").insert(chunk);
+    if (!first.error) return;
+    if (/poll_created_at/i.test(first.error.message)) {
+      const fallback = chunk.map(({ poll_created_at: _p, ...rest }) => rest);
+      const retry = await supabase.from("event_sale_lines").insert(fallback);
+      if (retry.error) throw retry.error;
+      return;
+    }
+    throw first.error;
   }
 
   async function confirmImport() {
@@ -983,6 +1059,7 @@ export default function EventoDetailPage() {
           certainty: row.certainty,
           arremate: row.arremate,
           poll_id: row.poll_id || "",
+          poll_created_at: row.poll_created_at || null,
           notes:
             row.import_status === "verificar_manual"
               ? "Revisão manual (❓) — bot não definiu ganhador"
@@ -995,15 +1072,13 @@ export default function EventoDetailPage() {
         if (row.import_status === "verificar_manual") insertedReview += 1;
         if (row.import_status === "sem_voto") insertedNoVotes += 1;
         if (chunk.length >= 80) {
-          const { error: err } = await supabase.from("event_sale_lines").insert(chunk);
-          if (err) throw err;
+          await insertSaleLineChunk(chunk);
           inserted += chunk.length;
           chunk.length = 0;
         }
       }
       if (chunk.length) {
-        const { error: err } = await supabase.from("event_sale_lines").insert(chunk);
-        if (err) throw err;
+        await insertSaleLineChunk(chunk);
         inserted += chunk.length;
       }
 
@@ -2046,6 +2121,21 @@ export default function EventoDetailPage() {
     }
   }
 
+  async function copyPedidoMsg(which: "pt" | "ja") {
+    const text = which === "pt" ? pedidoMsgs.pt : pedidoMsgs.ja;
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setInfo(
+        which === "pt"
+          ? "Mensagem do pedido em português copiada."
+          : "Mensagem do pedido em japonês copiada.",
+      );
+    } catch {
+      setError("Não foi possível copiar. Permita acesso à área de transferência.");
+    }
+  }
+
   /**
    * Atribui dono a uma linha ❓ ou sem votos.
    * Exige motivo (auditoria). Não toca pago/caixinha.
@@ -2233,10 +2323,26 @@ export default function EventoDetailPage() {
     setBusy(true);
     setError(null);
     try {
-      const text = await file.text();
-      const rows = parseEncomendaTemplateCsv(text);
+      const name = file.name.toLowerCase();
+      let rows: EncomendaCostRow[] = [];
+      let sheetNote = "";
+      if (name.endsWith(".csv") || name.endsWith(".txt")) {
+        rows = parseEncomendaTemplateCsv(await file.text());
+      } else {
+        const day = eventHappenedOn({
+          name: event?.name,
+          opened_at: event?.opened_at,
+        });
+        const parsed = await parseEncomendaXlsx(file, day);
+        rows = parsed.rows;
+        sheetNote = parsed.sheetUsed
+          ? ` aba “${parsed.sheetUsed}”`
+          : "";
+      }
       if (!rows.length) {
-        setError("Template sem linhas válidas (precisa coluna Carta).");
+        setError(
+          "Planilha sem cartas válidas. Use encomendas.xlsx (abas tipo Encomendas - 2608) ou o CSV com coluna Carta.",
+        );
         return;
       }
       await supabase.from("event_product_costs").delete().eq("event_id", eventId);
@@ -2247,10 +2353,18 @@ export default function EventoDetailPage() {
         price_sale: r.price_sale,
         price_liga: r.price_liga,
         link: r.link,
+        sort_index: r.sort_index ?? null,
       }));
-      const { error: err } = await supabase
+      let { error: err } = await supabase
         .from("event_product_costs")
         .insert(payload);
+      let missingSortCol = false;
+      if (err && /sort_index/i.test(err.message)) {
+        missingSortCol = true;
+        const fallback = payload.map(({ sort_index: _s, ...rest }) => rest);
+        const retry = await supabase.from("event_product_costs").insert(fallback);
+        err = retry.error;
+      }
       if (err) {
         setError(
           err.message.includes("event_product_costs")
@@ -2261,13 +2375,17 @@ export default function EventoDetailPage() {
       }
       await logStaffAction(supabase, {
         action: "upload_cost_template",
-        detail: `Template encomenda · ${rows.length} carta(s) · ${meName}`,
+        detail: `Custos encomenda · ${rows.length} carta(s)${sheetNote} · ${meName}`,
         created_by: meId,
         entity_type: "event",
         entity_id: eventId,
         event_id: eventId,
       });
-      setInfo(`Template importado: ${rows.length} carta(s).`);
+      setInfo(
+        missingSortCol
+          ? `Custos importados: ${rows.length} carta(s)${sheetNote}. Rode supabase/migration_event_money_sort.sql para guardar a ordem da aba.`
+          : `Custos importados: ${rows.length} carta(s)${sheetNote}.`,
+      );
       await load();
     } finally {
       setBusy(false);
@@ -2777,10 +2895,10 @@ export default function EventoDetailPage() {
           </button>
           {event.kind === "encomenda" ? (
             <label className="btn-secondary cursor-pointer">
-              Template JP/venda
+              Encomendas.xlsx / CSV
               <input
                 type="file"
-                accept=".csv,text/csv,text/plain"
+                accept=".xlsx,.xls,.csv,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 className="hidden"
                 disabled={busy}
                 onChange={(e) => {
@@ -2802,7 +2920,10 @@ export default function EventoDetailPage() {
       </div>
 
       <div
-        className={`panel mb-6 space-y-3 ${importDragging ? "ring-2 ring-zinc-900 ring-offset-2" : ""}`}
+        className={`grid gap-4 mb-6 ${event.kind === "encomenda" ? "lg:grid-cols-2" : ""}`}
+      >
+      <div
+        className={`panel space-y-3 ${importDragging ? "ring-2 ring-zinc-900 ring-offset-2" : ""}`}
         onDragEnter={(e) => {
           e.preventDefault();
           if ([...e.dataTransfer.types].includes("Files")) setImportDragging(true);
@@ -2887,8 +3008,9 @@ export default function EventoDetailPage() {
             <p className="text-sm text-zinc-600">
               {event.kind === "encomenda" ? (
                 <>
-                  Em <strong>encomenda</strong> só entram votos em{" "}
-                  <strong>Eu quero…</strong> (a opção 💙 é ignorada). Vários
+                  Em <strong>encomenda</strong> entram votos em{" "}
+                  <strong>Eu quero…</strong> e linhas de <strong>revisão ❓</strong>{" "}
+                  (clique que o bot não leu). A opção 💙 é ignorada. Vários
                   clientes na mesma carta entram normalmente. Reimportar só
                   adiciona quem ainda faltava.
                 </>
@@ -2990,12 +3112,35 @@ export default function EventoDetailPage() {
         )}
       </div>
 
-      {event.kind === "encomenda" && productCosts.length > 0 ? (
-        <p className="mb-4 text-sm text-zinc-600">
-          Template de custos: <strong>{productCosts.length}</strong> carta(s)
-          carregada(s).
-        </p>
+      {event.kind === "encomenda" ? (
+        <div className="panel space-y-3">
+          <div>
+            <h2 className="text-base font-semibold text-zinc-900">
+              Planilha Encomendas.xlsx
+            </h2>
+            <p className="mt-1 text-sm text-zinc-600">
+              O mesmo arquivo do lote automático. Cruza <strong>nome da carta +
+              data da aba</strong> (ex.: Encomendas - 2608) com esta rodada para
+              custo JP, venda e lucro.
+            </p>
+          </div>
+          <FileDropZone
+            accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+            disabled={busy}
+            title="Solte o encomendas.xlsx aqui"
+            hint="Abas tipo Encomendas - 2608. Também aceita o CSV antigo (Carta / ValorJP / venda)."
+            onFile={async (f) => {
+              await uploadEncomendaTemplate(f);
+            }}
+          />
+          {productCosts.length > 0 ? (
+            <p className="text-sm text-zinc-600">
+              Custos carregados: <strong>{productCosts.length}</strong> carta(s).
+            </p>
+          ) : null}
+        </div>
       ) : null}
+      </div>
 
       <EventResumoPanel kind={event.kind || "leilao"} resumo={eventResumo} />
 
@@ -3102,13 +3247,29 @@ export default function EventoDetailPage() {
                 </p>
               ) : null}
             </div>
-            <button
-              type="button"
-              className="btn-secondary text-xs"
-              onClick={() => void healLeilaoStatuses()}
-            >
-              Corrigir status legado (lance sem dono → sem votos)
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className={cardSort === "enquete" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("enquete")}
+              >
+                Ordem da enquete
+              </button>
+              <button
+                type="button"
+                className={cardSort === "nome" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("nome")}
+              >
+                A–Z
+              </button>
+              <button
+                type="button"
+                className="btn-secondary text-xs"
+                onClick={() => void healLeilaoStatuses()}
+              >
+                Corrigir status legado (lance sem dono → sem votos)
+              </button>
+            </div>
           </div>
           <div className="grid gap-4 lg:grid-cols-3">
             <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
@@ -3794,14 +3955,30 @@ export default function EventoDetailPage() {
                 levas forem parciais.
               </p>
             </div>
-            <button
-              type="button"
-              className="btn-primary"
-              disabled={busy}
-              onClick={() => void markAllProductsFullyArrived()}
-            >
-              Chegou tudo desta rodada
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className={cardSort === "enquete" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("enquete")}
+              >
+                Ordem da enquete
+              </button>
+              <button
+                type="button"
+                className={cardSort === "nome" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("nome")}
+              >
+                A–Z
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={busy}
+                onClick={() => void markAllProductsFullyArrived()}
+              >
+                Chegou tudo desta rodada
+              </button>
+            </div>
           </div>
           <ul className="space-y-3">
             {productSummary.map((row) => {
@@ -4839,6 +5016,112 @@ export default function EventoDetailPage() {
               ))}
             </ul>
           ) : null}
+        </section>
+      ) : null}
+
+      {event.kind === "encomenda" && productSummary.length > 0 ? (
+        <section className="panel mb-6">
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h2 className="font-semibold">Controle do pedido ao Japão</h2>
+              <p className="mt-1 text-sm text-zinc-600">
+                Uma linha por modelo de carta. Se pediram 9 da mesma, encomende
+                as 9 de uma vez e marque <strong>Pedido feito</strong>.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                className={cardSort === "enquete" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("enquete")}
+              >
+                Ordem da enquete
+              </button>
+              <button
+                type="button"
+                className={cardSort === "nome" ? "btn-primary text-xs" : "btn-secondary text-xs"}
+                onClick={() => setCardSort("nome")}
+              >
+                A–Z
+              </button>
+            </div>
+          </div>
+          <div className="mb-4 grid gap-3 lg:grid-cols-2">
+            <div className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-zinc-800">
+                  Mensagem pronta (português)
+                </h3>
+                <button
+                  type="button"
+                  className="btn-secondary px-2 py-1 text-xs"
+                  onClick={() => void copyPedidoMsg("pt")}
+                >
+                  Copiar
+                </button>
+              </div>
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap text-xs text-zinc-800">
+                {pedidoMsgs.pt}
+              </pre>
+            </div>
+            <div className="rounded-md border border-zinc-200 bg-zinc-50 p-3">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-zinc-800">
+                  Mensagem pronta (japonês)
+                </h3>
+                <button
+                  type="button"
+                  className="btn-secondary px-2 py-1 text-xs"
+                  onClick={() => void copyPedidoMsg("ja")}
+                >
+                  Copiar
+                </button>
+              </div>
+              <pre className="max-h-56 overflow-auto whitespace-pre-wrap text-xs text-zinc-800">
+                {pedidoMsgs.ja}
+              </pre>
+            </div>
+          </div>
+          <div className="table-wrap">
+            <table className="data text-sm">
+              <thead>
+                <tr>
+                  <th>Carta</th>
+                  <th>Qtd</th>
+                  <th>Pedido ao JP</th>
+                  <th>Falta pedir</th>
+                </tr>
+              </thead>
+              <tbody>
+                {productSummary.map((row) => (
+                  <tr key={`ctrl-${row.title}`}>
+                    <td className="font-medium">{row.title}</td>
+                    <td>{row.ordered}</td>
+                    <td>
+                      <label className="inline-flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={row.pedidoFeito}
+                          disabled={busy}
+                          onChange={(e) =>
+                            void setPedidoFeito(row.title, e.target.checked)
+                          }
+                        />
+                        {row.pedidoFeito ? "feito" : "pendente"}
+                      </label>
+                    </td>
+                    <td>
+                      {row.pedidoFeito ? (
+                        <Badge tone="good">ok</Badge>
+                      ) : (
+                        <Badge tone="warn">{row.ordered} un.</Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       ) : null}
     </div>

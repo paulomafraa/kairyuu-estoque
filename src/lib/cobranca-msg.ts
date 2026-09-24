@@ -52,6 +52,62 @@ export type BillingLine = {
   qty: number;
 };
 
+/** Tira o sufixo de preço do título da enquete (ex.: "Zorua (072/064) - R$ 12,50"). */
+export function stripCardPriceSuffix(title: string): string {
+  return (title || "")
+    .replace(/\s*[-–—]\s*R\$\s*[\d.]+(?:,\d{1,2})?\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function formatDiaJa(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(`${iso.slice(0, 10)}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+export type EncomendaPedidoItem = {
+  title: string;
+  qty: number;
+};
+
+/** Mensagens prontas do pedido da rodada (pt-BR e japonês). */
+export function buildEncomendaPedidoMessages(opts: {
+  eventDate: string | null | undefined;
+  items: EncomendaPedidoItem[];
+}): { pt: string; ja: string } {
+  const items = opts.items
+    .map((it) => ({
+      title: stripCardPriceSuffix(it.title),
+      qty: Number(it.qty) > 0 ? Number(it.qty) : 1,
+    }))
+    .filter((it) => it.title);
+  const modelos = items.length;
+  const unidades = items.reduce((n, it) => n + it.qty, 0);
+  const rows = items.map((it) => `• ${it.title} × ${it.qty}`);
+  const diaPt = formatDiaLongo(opts.eventDate);
+  const diaJa = formatDiaJa(opts.eventDate);
+
+  const pt = [
+    `Pedido da rodada de encomendas${diaPt !== "—" ? ` — ${diaPt}` : ""}`,
+    ``,
+    ...rows,
+    ``,
+    `Total: ${modelos} modelo(s) · ${unidades} unidade(s)`,
+  ].join("\n");
+
+  const ja = [
+    `委託ラウンド注文${diaJa ? `（${diaJa}）` : ""}`,
+    ``,
+    ...rows,
+    ``,
+    `合計：${modelos}種・${unidades}枚`,
+  ].join("\n");
+
+  return { pt, ja };
+}
+
 export function formatMoneyBr(n: number): string {
   return n.toLocaleString("pt-BR", {
     minimumFractionDigits: 2,

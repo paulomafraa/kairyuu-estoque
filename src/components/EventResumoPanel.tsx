@@ -23,7 +23,15 @@ export function EventResumoPanel({
 
       <div className="flex flex-wrap gap-2 text-sm">
         <Badge tone="info">{resumo.activeLines} item(ns) ativos</Badge>
-        <Badge tone="good">R$ {formatMoneyBr(resumo.salesTotal)} vendas</Badge>
+        <Badge tone="good">
+          Recebido: R$ {formatMoneyBr(resumo.paidTotal)}
+        </Badge>
+        <Badge tone="warn">
+          A receber: R$ {formatMoneyBr(resumo.unpaidTotal)}
+        </Badge>
+        <Badge tone="neutral">
+          Faturamento: R$ {formatMoneyBr(resumo.salesTotal)}
+        </Badge>
         <Badge tone="warn">{resumo.unpaidLines} em aberto</Badge>
         <Badge tone="neutral">{resumo.paidLines} pago(s)</Badge>
         {resumo.missingPrice > 0 ? (
@@ -100,25 +108,26 @@ export function EventResumoPanel({
         <div className="space-y-3 rounded-md border border-emerald-200 bg-emerald-50/40 p-3">
           <div>
             <h3 className="text-sm font-semibold text-emerald-950">
-              Custo JP × venda (template da rodada)
+              Faturamento × lucro desta rodada
             </h3>
             <p className="mt-1 text-xs text-emerald-900/80">
-              Imposto estimado: +10% sobre o custo no Japão. Lucro ≈ venda − (JP
-              + 10%).
+              Gasto = custo JP + 10% de imposto. Lucro = o que está sendo cobrado
+              menos esse gasto. Cruza a planilha Encomendas.xlsx (nome + data da
+              aba) com as cartas da rodada.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-sm">
-            <Badge tone="neutral">
-              JP: R$ {formatMoneyBr(resumo.cost.totalJp)}
+            <Badge tone="info">
+              Faturamento: R$ {formatMoneyBr(resumo.cost.faturamento)}
             </Badge>
             <Badge tone="warn">
-              JP+10%: R$ {formatMoneyBr(resumo.cost.totalJpTax)}
-            </Badge>
-            <Badge tone="info">
-              Venda (template): R$ {formatMoneyBr(resumo.cost.totalSaleMatched)}
+              Gasto (JP+10%): R$ {formatMoneyBr(resumo.cost.gasto)}
             </Badge>
             <Badge tone="good">
-              Lucro est.: R$ {formatMoneyBr(resumo.cost.totalProfit)}
+              Lucro: R$ {formatMoneyBr(resumo.cost.lucro)}
+            </Badge>
+            <Badge tone="neutral">
+              JP: R$ {formatMoneyBr(resumo.cost.totalJp)}
             </Badge>
             <Badge tone="neutral">
               {resumo.cost.matched} un. casadas
@@ -174,8 +183,8 @@ export function EventResumoPanel({
 
       {kind === "encomenda" && !resumo.cost ? (
         <p className="text-sm text-zinc-500">
-          Envie o CSV-template da rodada (Valor JP / venda / liga) para ver custo,
-          imposto e lucro estimado.
+          Jogue o <strong>encomendas.xlsx</strong> (o mesmo do lote automático)
+          para cruzar custo, faturamento e lucro desta rodada.
         </p>
       ) : null}
     </section>

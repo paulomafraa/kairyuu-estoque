@@ -145,6 +145,7 @@ export type EventProductCost = {
   price_sale: number | null;
   price_liga: number | null;
   link: string;
+  sort_index?: number | null;
   created_at: string;
 };
 
@@ -170,6 +171,8 @@ export type EventSaleLine = {
   certainty: "certain" | "manual_review";
   arremate: boolean;
   poll_id: string;
+  /** Quando a enquete foi aberta no WhatsApp (se a planilha trouxer). */
+  poll_created_at?: string | null;
   separated: boolean;
   separated_at: string | null;
   separated_by: string | null;

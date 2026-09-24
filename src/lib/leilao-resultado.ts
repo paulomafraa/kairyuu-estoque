@@ -12,6 +12,7 @@ export type ResultadoRow = {
   verificar_manual: string;
   cliques_sem_opcao?: string;
   poll_id: string;
+  criada_em?: string;
 };
 
 export type ParsedSaleLine = {
@@ -31,6 +32,8 @@ export type ParsedSaleLine = {
   arremate: boolean;
   poll_id: string;
   qty: number;
+  poll_created_at?: string;
+  poll_ordem?: number;
 };
 
 /** Opção firme de encomenda (!encE) — ignora 💙💙💙. */
@@ -247,6 +250,8 @@ export function resultadoToSaleLine(row: ResultadoRow): ParsedSaleLine | null {
       import_status === "arrematado",
     poll_id: (row.poll_id || "").trim(),
     qty: 1,
+    poll_created_at: (row.criada_em || "").trim() || undefined,
+    poll_ordem: Number(row.ordem) > 0 ? Number(row.ordem) : undefined,
   };
 }
 
@@ -282,7 +287,7 @@ export function saleLineImportDedupeKey(
 /**
  * Filtra linhas conforme o tipo do evento.
  * - leilão: arremate/lance certos + revisão ❓ + sem votos (controle do que saiu)
- * - encomenda: só votos em "Eu quero…"
+ * - encomenda: votos em "Eu quero…" + revisão ❓ (💙 e sem voto ficam de fora)
  */
 export function filterLinesForKind(
   lines: ParsedSaleLine[],
@@ -291,7 +296,8 @@ export function filterLinesForKind(
   if (kind === "encomenda") {
     const keep = lines.filter(
       (l) =>
-        l.import_status === "voto" && isEncQueroOption(l.valor_ou_opcao),
+        l.import_status === "verificar_manual" ||
+        (l.import_status === "voto" && isEncQueroOption(l.valor_ou_opcao)),
     );
     return { keep, skipped: lines.length - keep.length };
   }
@@ -320,6 +326,8 @@ function rowsFromMatrix(matrix: string[][]): ResultadoRow[] {
   const iArr = idx(["arremate"]);
   const iVer = idx(["verificar_manual", "verificar"]);
   const iPoll = idx(["poll_id", "pollid"]);
+  const iCriada = idx(["criada_em", "criadaem", "created_at", "poll_created"]);
+  const iOrdem = idx(["ordem"]);
 
   if (iCarta < 0) return [];
 
@@ -336,6 +344,8 @@ function rowsFromMatrix(matrix: string[][]): ResultadoRow[] {
       arremate: String(iArr >= 0 ? line[iArr] ?? "" : ""),
       verificar_manual: String(iVer >= 0 ? line[iVer] ?? "" : ""),
       poll_id: String(iPoll >= 0 ? line[iPoll] ?? "" : ""),
+      criada_em: String(iCriada >= 0 ? line[iCriada] ?? "" : ""),
+      ordem: String(iOrdem >= 0 ? line[iOrdem] ?? "" : ""),
     });
   }
   return out;
