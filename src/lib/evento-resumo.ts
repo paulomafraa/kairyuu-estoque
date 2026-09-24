@@ -13,12 +13,23 @@ export type ResumoLine = {
   customer_id: string | null;
   customer_name: string;
   phone: string;
+  phone_digits?: string | null;
   cancelled?: boolean;
   paid?: boolean;
   import_status?: string;
   valor_ou_opcao?: string;
   archived?: boolean | null;
 };
+
+export function saleLineHasOwner(l: {
+  customer_id?: string | null;
+  phone?: string | null;
+  phone_digits?: string | null;
+}): boolean {
+  if (l.customer_id) return true;
+  const digits = String(l.phone_digits || l.phone || "").replace(/\D/g, "");
+  return digits.length >= 10;
+}
 
 export type CustomerSalesRow = {
   key: string;
@@ -91,10 +102,11 @@ export function buildEventResumo(
   for (const l of active) {
     const qty = Number(l.qty) > 0 ? Number(l.qty) : 1;
     const price = linePrice(l);
+    const owned = saleLineHasOwner(l);
     if (l.paid) paidLines += 1;
     else unpaidLines += 1;
     if (price == null) missingPrice += 1;
-    else {
+    else if (owned) {
       const lineTotal = price * qty;
       salesTotal += lineTotal;
       if (l.paid) paidTotal += lineTotal;
@@ -153,7 +165,7 @@ export function buildEventResumo(
         qtyByTitle.set(key, bucket);
       }
       bucket.qty += qty;
-      if (price != null) bucket.saleSum += price * qty;
+      if (price != null && saleLineHasOwner(l)) bucket.saleSum += price * qty;
     }
 
     for (const [key, bucket] of qtyByTitle) {

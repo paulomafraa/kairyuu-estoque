@@ -18,6 +18,7 @@ export function EventResumoPanel({
         <h2 className="font-semibold">Resumo do evento</h2>
         <p className="mt-1 text-sm text-zinc-600">
           Totais com base no que está na interface agora (após correções).
+          Recebido e a receber só entram carta com dono (cliente associado).
         </p>
       </div>
 

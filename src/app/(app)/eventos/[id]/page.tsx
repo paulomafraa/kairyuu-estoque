@@ -56,7 +56,13 @@ import {
   productMatchKey,
   type EncomendaCostRow,
 } from "@/lib/encomenda-template";
-import { buildEventResumo } from "@/lib/evento-resumo";
+import { buildEventResumo, saleLineHasOwner } from "@/lib/evento-resumo";
+import { cardTitleToJa } from "@/lib/card-title-ja";
+import {
+  embedCardOrder,
+  orderMapFromTitles,
+  parseEmbeddedCardOrder,
+} from "@/lib/card-order";
 import {
   cardSortMs,
   compareByCardSort,
@@ -307,6 +313,10 @@ export default function EventoDetailPage() {
 
   const [productCosts, setProductCosts] = useState<EventProductCost[]>([]);
   const [cardSort, setCardSort] = useState<CardSortMode>("enquete");
+  const [cardOrder, setCardOrder] = useState<Record<string, number>>({});
+  const [orphanDeleteOpen, setOrphanDeleteOpen] = useState(false);
+  const [orphanDeleteReason, setOrphanDeleteReason] = useState("");
+  const [orphanDeleteIds, setOrphanDeleteIds] = useState<string[]>([]);
   const [controlReason, setControlReason] = useState("");
   const [orphanLineId, setOrphanLineId] = useState<string | null>(null);
   const [orphanSearch, setOrphanSearch] = useState("");
@@ -378,7 +388,7 @@ export default function EventoDetailPage() {
         .from("event_product_costs")
         .select("*")
         .eq("event_id", eventId)
-        .order("product_title"),
+        .order("created_at", { ascending: true }),
     ]);
 
     if (ev.error) setError(ev.error.message);
@@ -393,6 +403,7 @@ export default function EventoDetailPage() {
       );
       setEventNameEdit((ev.data as Event).name || "");
       setShowBox(Boolean((ev.data as Event).use_stock_box));
+      setCardOrder(parseEmbeddedCardOrder((ev.data as Event).notes));
     }
 
     if (ln.error) setError(ln.error.message);
@@ -632,12 +643,42 @@ export default function EventoDetailPage() {
     return map;
   }, [productCosts]);
 
+  const firstSeenIndex = useMemo(() => {
+    const map = new Map<string, number>();
+    let i = 0;
+    for (const line of lines) {
+      const key = productMatchKey(line.product_title);
+      if (!key || map.has(key)) continue;
+      i += 1;
+      map.set(key, i);
+    }
+    return map;
+  }, [lines]);
+
+  const ownerlessLines = useMemo(
+    () =>
+      lines.filter(
+        (l) =>
+          !l.cancelled &&
+          !isShelvedSaleLine(l, event?.kind) &&
+          !saleLineHasOwner({
+            customer_id: l.customer_id,
+            phone: l.customers?.phone,
+            phone_digits: l.phone_digits,
+          }),
+      ),
+    [lines, event?.kind],
+  );
+
   function lineCardSortMs(line: EventSaleLine): number {
-    const cost = costIndex.get(productMatchKey(line.product_title));
+    const key = productMatchKey(line.product_title);
+    const cost = key ? costIndex.get(key) : undefined;
+    const fromSheet =
+      cost?.sort_index ?? (key && cardOrder[key] != null ? cardOrder[key] : null);
     return cardSortMs({
       pollCreatedAt: line.poll_created_at,
-      sortIndex: cost?.sort_index,
-      createdAt: line.created_at,
+      sortIndex: fromSheet ?? (key ? firstSeenIndex.get(key) : null) ?? null,
+      createdAt: null,
     });
   }
 
@@ -705,7 +746,7 @@ export default function EventoDetailPage() {
       const bMs = Math.min(...b.lines.map((l) => lineCardSortMs(l)));
       return compareByCardSort(a.title, aMs, b.title, bMs, cardSort);
     });
-  }, [lines, productStock, event?.kind, cardSort, costIndex]);
+  }, [lines, productStock, event?.kind, cardSort, costIndex, cardOrder, firstSeenIndex]);
 
   const leilaoBuckets = useMemo(() => {
     if (event?.kind !== "leilao") {
@@ -733,7 +774,7 @@ export default function EventoDetailPage() {
     review.sort(byCard);
     noVotes.sort(byCard);
     return { certain, review, noVotes };
-  }, [lines, event?.kind, cardSort, costIndex]);
+  }, [lines, event?.kind, cardSort, costIndex, cardOrder, firstSeenIndex]);
 
   const eventResumo = useMemo(() => {
     const costRows: EncomendaCostRow[] = productCosts.map((c) => ({
@@ -756,6 +797,7 @@ export default function EventoDetailPage() {
           l.phone_digits ||
           "",
         phone: l.customers?.phone || l.phone_digits || "",
+        phone_digits: l.phone_digits,
         cancelled: l.cancelled,
         paid: l.paid,
         import_status: l.import_status,
@@ -775,6 +817,7 @@ export default function EventoDetailPage() {
         opened_at: event.opened_at,
       }),
       items: productSummary.map((r) => ({ title: r.title, qty: r.ordered })),
+      titleJa: cardTitleToJa,
     });
   }, [event, productSummary]);
 
@@ -1670,11 +1713,13 @@ export default function EventoDetailPage() {
     }
   }
 
-  async function cancelLines(ids: string[]) {
+  async function cancelLines(ids: string[], reasonText?: string) {
     if (!ids.length) return;
-    const reason = window.prompt(
-      "Motivo do cancelamento (obrigatório): cliente não pagou, desistiu, etc.",
-    );
+    const reason =
+      reasonText ??
+      window.prompt(
+        "Motivo do cancelamento (obrigatório): cliente não pagou, desistiu, etc.",
+      );
     if (reason == null) return;
     if (!reason.trim()) {
       setError("Informe o motivo do cancelamento.");
@@ -1711,6 +1756,26 @@ export default function EventoDetailPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function openOrphanDelete(ids: string[]) {
+    if (!ids.length) return;
+    setOrphanDeleteIds(ids);
+    setOrphanDeleteReason("");
+    setOrphanDeleteOpen(true);
+    setError(null);
+  }
+
+  async function confirmOrphanDelete() {
+    const reason = orphanDeleteReason.trim();
+    if (reason.length < 3) {
+      setError("Escreva o motivo na caixa de observação (obrigatório).");
+      return;
+    }
+    await cancelLines(orphanDeleteIds, reason);
+    setOrphanDeleteOpen(false);
+    setOrphanDeleteReason("");
+    setOrphanDeleteIds([]);
   }
 
   function selectedIdsFromParticipant(): string[] {
@@ -2381,6 +2446,12 @@ export default function EventoDetailPage() {
         entity_id: eventId,
         event_id: eventId,
       });
+      const order = orderMapFromTitles(rows.map((r) => r.product_title));
+      setCardOrder(order);
+      await supabase
+        .from("events")
+        .update({ notes: embedCardOrder(event?.notes, order) })
+        .eq("id", eventId);
       setInfo(
         missingSortCol
           ? `Custos importados: ${rows.length} carta(s)${sheetNote}. Rode supabase/migration_event_money_sort.sql para guardar a ordem da aba.`
@@ -3950,9 +4021,9 @@ export default function EventoDetailPage() {
               <h2 className="font-semibold">Resumo das encomendas</h2>
               <p className="mt-1 text-sm text-zinc-600">
                 Cada voto em Eu quero… conta 1 un. por padrão. Votos 💙 ficam na aba
-                retrátil e não entram neste resumo. Dá pra deixar várias cartas
-                abertas ao mesmo tempo. Marque a chegada por cliente quando as
-                levas forem parciais.
+                retrátil e não entram neste resumo. A ordem da enquete segue a
+                aba do encomendas.xlsx (a mesma do lote). Sem o arquivo, A–Z e
+                enquete ficam iguais.
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -4405,9 +4476,21 @@ export default function EventoDetailPage() {
 
       <div className="mb-6 grid gap-4 xl:grid-cols-[minmax(280px,1fr)_minmax(0,2fr)]">
         <section className="panel">
-          <h2 className="mb-3 font-semibold">
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+          <h2 className="font-semibold">
             Participantes ({participants.length})
           </h2>
+          {event.kind === "encomenda" && ownerlessLines.length > 0 ? (
+            <button
+              type="button"
+              className="btn-danger px-2 py-1 text-xs"
+              disabled={busy}
+              onClick={() => openOrphanDelete(ownerlessLines.map((l) => l.id))}
+            >
+              Excluir {ownerlessLines.length} sem dono
+            </button>
+          ) : null}
+          </div>
           {participants.length === 0 ? (
             <EmptyState
               title="Ninguém ainda"
@@ -4632,13 +4715,45 @@ export default function EventoDetailPage() {
                 >
                   Arquivar seleção
                 </button>
-                <ConfirmButton
-                  label="Cancelar itens"
-                  confirmLabel="Cancelar selecionados?"
-                  className="btn-danger"
-                  disabled={selectedCount === 0}
-                  onConfirm={() => cancelLines(selectedIdsFromParticipant())}
-                />
+                {activeParticipant &&
+                !saleLineHasOwner({
+                  customer_id: activeParticipant.customer_id,
+                  phone: activeParticipant.phone,
+                }) ? (
+                  <button
+                    type="button"
+                    className="btn-danger"
+                    disabled={busy || activeMainLines.length === 0}
+                    onClick={() =>
+                      openOrphanDelete(activeMainLines.map((l) => l.id))
+                    }
+                  >
+                    Excluir carta sem dono
+                  </button>
+                ) : (
+                  <ConfirmButton
+                    label="Cancelar itens"
+                    confirmLabel="Cancelar selecionados?"
+                    className="btn-danger"
+                    disabled={selectedCount === 0}
+                    onConfirm={() => {
+                      const ids = selectedIdsFromParticipant();
+                      const allOrphan = ids.every((id) => {
+                        const l = lines.find((x) => x.id === id);
+                        return (
+                          l &&
+                          !saleLineHasOwner({
+                            customer_id: l.customer_id,
+                            phone: l.customers?.phone,
+                            phone_digits: l.phone_digits,
+                          })
+                        );
+                      });
+                      if (allOrphan) openOrphanDelete(ids);
+                      else void cancelLines(ids);
+                    }}
+                  />
+                )}
                 {selectedCount > 0 ? (
                   <span className="text-xs text-zinc-500">
                     {selectedCount} selecionado(s)
@@ -5123,6 +5238,55 @@ export default function EventoDetailPage() {
             </table>
           </div>
         </section>
+      ) : null}
+
+      {orphanDeleteOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="w-full max-w-md rounded-lg bg-white p-4 shadow-xl"
+          >
+            <h2 className="text-base font-semibold text-zinc-900">
+              Excluir carta(s) sem dono
+            </h2>
+            <p className="mt-2 text-sm text-zinc-600">
+              {orphanDeleteIds.length} carta(s) sem cliente. Isso tira elas da
+              rodada e do a receber. Escreva o motivo (obrigatório).
+            </p>
+            <label className="mt-3 block text-sm">
+              <span className="mb-1 block text-zinc-600">Observação / motivo</span>
+              <textarea
+                className="field min-h-24"
+                value={orphanDeleteReason}
+                onChange={(e) => setOrphanDeleteReason(e.target.value)}
+                placeholder="Ex.: enquete sem voto, bot não leu o dono, carta de teste…"
+              />
+            </label>
+            <div className="mt-4 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={busy}
+                onClick={() => {
+                  setOrphanDeleteOpen(false);
+                  setOrphanDeleteReason("");
+                  setOrphanDeleteIds([]);
+                }}
+              >
+                Voltar
+              </button>
+              <button
+                type="button"
+                className="btn-danger"
+                disabled={busy || orphanDeleteReason.trim().length < 3}
+                onClick={() => void confirmOrphanDelete()}
+              >
+                Excluir
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

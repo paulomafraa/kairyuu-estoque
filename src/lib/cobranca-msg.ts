@@ -76,6 +76,7 @@ export type EncomendaPedidoItem = {
 export function buildEncomendaPedidoMessages(opts: {
   eventDate: string | null | undefined;
   items: EncomendaPedidoItem[];
+  titleJa?: (title: string) => string;
 }): { pt: string; ja: string } {
   const items = opts.items
     .map((it) => ({
@@ -85,14 +86,16 @@ export function buildEncomendaPedidoMessages(opts: {
     .filter((it) => it.title);
   const modelos = items.length;
   const unidades = items.reduce((n, it) => n + it.qty, 0);
-  const rows = items.map((it) => `• ${it.title} × ${it.qty}`);
+  const toJa = opts.titleJa || ((t: string) => t);
+  const rowsPt = items.map((it) => `• ${it.title} × ${it.qty}`);
+  const rowsJa = items.map((it) => `• ${toJa(it.title)} × ${it.qty}`);
   const diaPt = formatDiaLongo(opts.eventDate);
   const diaJa = formatDiaJa(opts.eventDate);
 
   const pt = [
     `Pedido da rodada de encomendas${diaPt !== "—" ? ` — ${diaPt}` : ""}`,
     ``,
-    ...rows,
+    ...rowsPt,
     ``,
     `Total: ${modelos} modelo(s) · ${unidades} unidade(s)`,
   ].join("\n");
@@ -100,7 +103,7 @@ export function buildEncomendaPedidoMessages(opts: {
   const ja = [
     `委託ラウンド注文${diaJa ? `（${diaJa}）` : ""}`,
     ``,
-    ...rows,
+    ...rowsJa,
     ``,
     `合計：${modelos}種・${unidades}枚`,
   ].join("\n");
