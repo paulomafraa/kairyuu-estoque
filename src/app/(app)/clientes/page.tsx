@@ -1,7 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
@@ -9,12 +16,15 @@ import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  buildPhoneLookup,
+  customerPhoneDigits,
   ensureCustomerByPhone,
   fetchAllCustomers,
   fetchAllQueryRows,
-  matchesCustomerQuery,
+  normalizeSearchHay,
+  phoneInLookup,
+  phoneVariants,
 } from "@/lib/customers";
-import { phoneInSet } from "@/lib/customer-activity";
 import {
   daysSincePayment,
   formatLeilaoGarageDeadline,
@@ -39,16 +49,72 @@ type SilentGroupMember = {
   name: string;
   message_count: number;
   synced_at: string;
+  searchHay: string;
 };
 
 /** Limiar alinhado ao default do !inativos loja (≤5 msgs). */
 const INACTIVE_MSG_MAX = 5;
+/** Evita montar milhares de <tr> a cada tecla da busca. */
+const LIST_RENDER_LIMIT = 80;
+/** Só filtra a lista depois que a digitação para. Enter aplica na hora. */
+const SEARCH_IDLE_MS = 1000;
+
+function CustomerSearchField({
+  applied,
+  onSearch,
+}: {
+  applied: string;
+  onSearch: (q: string) => void;
+}) {
+  const [value, setValue] = useState(applied);
+  const onSearchRef = useRef(onSearch);
+  const skipIdle = useRef(true);
+  onSearchRef.current = onSearch;
+
+  useEffect(() => {
+    if (skipIdle.current) {
+      skipIdle.current = false;
+      return;
+    }
+    const t = window.setTimeout(
+      () => onSearchRef.current(value),
+      SEARCH_IDLE_MS,
+    );
+    return () => window.clearTimeout(t);
+  }, [value]);
+
+  const pending = value.trim() !== applied.trim();
+
+  return (
+    <div className="mb-3 max-w-md">
+      <input
+        className="field"
+        placeholder="Buscar cliente..."
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== "Enter") return;
+          e.preventDefault();
+          onSearch(value);
+        }}
+      />
+      {pending ? (
+        <p className="mt-1 text-xs text-zinc-500">
+          A lista atualiza quando você parar de digitar, ou aperte Enter.
+        </p>
+      ) : null}
+    </div>
+  );
+}
 
 type CustomerRow = Customer & {
   hasOrders: boolean;
   pendencias: number;
   pendenciaLabel: string;
   caixinhaCount: number;
+  searchHay: string;
+  searchDigits: string;
+  silentInactive: boolean;
   leilaoGarage?: {
     count: number;
     worst: "ok" | "warn" | "overdue";
@@ -61,9 +127,6 @@ type CustomerRow = Customer & {
 export default function ClientesPage() {
   const supabase = useMemo(() => createClient(), []);
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
-  const [silentGroupPhones, setSilentGroupPhones] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [lowActivityByPhone, setLowActivityByPhone] = useState<
     Map<string, number>
   >(() => new Map());
@@ -71,7 +134,7 @@ export default function ClientesPage() {
     SilentGroupMember[]
   >([]);
   const [groupSyncAt, setGroupSyncAt] = useState<string | null>(null);
-  const [q, setQ] = useState("");
+  const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("todos");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -96,7 +159,6 @@ export default function ClientesPage() {
       { data: items },
       { data: orders },
       unpaidLines,
-      saleCustomerIds,
       { data: events },
       { data: garage },
       { data: groupActivity, error: groupErr },
@@ -130,18 +192,6 @@ export default function ClientesPage() {
         console.error(e);
         return [];
       }),
-      fetchAllQueryRows<{ id: string; customer_id: string }>((from, to) =>
-        supabase
-          .from("event_sale_lines")
-          .select("id, customer_id")
-          .eq("cancelled", false)
-          .not("customer_id", "is", null)
-          .order("id", { ascending: true })
-          .range(from, to),
-      ).catch((e) => {
-        console.error(e);
-        return [];
-      }),
       supabase.from("events").select("id, payment_due_at, name, kind"),
       supabase
         .from("customer_garage_items")
@@ -158,25 +208,32 @@ export default function ClientesPage() {
     ]);
 
     let lowActivityRows: SilentGroupMember[] = [];
+    let silentLookup = new Set<string>();
     if (groupErr) {
       // migration ainda não rodada — filtro inativos fica vazio
       console.warn("whatsapp_group_activity:", groupErr.message);
-      setSilentGroupPhones(new Set());
       setLowActivityByPhone(new Map());
       setSilentUnregistered([]);
       setGroupSyncAt(null);
     } else {
-      lowActivityRows = (groupActivity || []) as SilentGroupMember[];
+      lowActivityRows = (groupActivity || []).map((r) => {
+        const row = r as Omit<SilentGroupMember, "searchHay">;
+        return {
+          ...row,
+          searchHay: normalizeSearchHay(`${row.name} ${row.phone_digits}`),
+        };
+      });
       const phones = new Set(
         lowActivityRows
           .map((r) => normalizePhoneDigits(r.phone_digits))
           .filter(Boolean),
       );
-      setSilentGroupPhones(phones);
+      silentLookup = buildPhoneLookup(phones);
       const msgMap = new Map<string, number>();
       for (const r of lowActivityRows) {
         const d = normalizePhoneDigits(r.phone_digits);
-        if (d) msgMap.set(d, r.message_count);
+        if (!d) continue;
+        for (const v of phoneVariants(d)) msgMap.set(v, r.message_count);
       }
       setLowActivityByPhone(msgMap);
       let latest: string | null = null;
@@ -198,7 +255,7 @@ export default function ClientesPage() {
     const activeIds = new Set<string>();
     for (const row of items || []) activeIds.add(row.customer_id);
     for (const row of orders || []) activeIds.add(row.customer_id);
-    for (const row of saleCustomerIds || []) {
+    for (const row of unpaidLines || []) {
       if (row.customer_id) activeIds.add(row.customer_id);
     }
     for (const row of garage || []) activeIds.add(row.customer_id as string);
@@ -288,12 +345,18 @@ export default function ClientesPage() {
             sinceIso: leilao.sinceIso,
           })
         : null;
+      const digits = customerPhoneDigits(c);
       return {
         ...c,
         hasOrders: activeIds.has(c.id),
         pendencias: pend?.n || 0,
         pendenciaLabel: pend?.hints.join(" · ") || "",
         caixinhaCount: garageByCustomer.get(c.id) || 0,
+        searchHay: normalizeSearchHay(
+          `${c.name || ""} ${c.phone || ""} ${c.phone_digits || ""}`,
+        ),
+        searchDigits: digits,
+        silentInactive: phoneInLookup(digits, silentLookup),
         leilaoGarage: leilao
           ? {
               count: leilao.count,
@@ -308,12 +371,12 @@ export default function ClientesPage() {
     setCustomers(mapped);
 
     if (!groupErr && lowActivityRows.length) {
-      const customerPhones = mapped.map(
-        (c) => c.phone_digits || normalizePhoneDigits(c.phone || ""),
+      const customerLookup = buildPhoneLookup(
+        mapped.map((c) => c.searchDigits),
       );
       setSilentUnregistered(
         lowActivityRows.filter(
-          (r) => !phoneInSet(r.phone_digits, customerPhones),
+          (r) => !phoneInLookup(r.phone_digits, customerLookup),
         ),
       );
     }
@@ -485,60 +548,86 @@ export default function ClientesPage() {
     }
   }
 
-  const filtered = customers
-    .filter((c) => {
-    if (filter === "ativos" && !c.hasOrders) return false;
-    if (filter === "sem_pedidos" && c.hasOrders) return false;
-    if (filter === "pendencias" && c.pendencias <= 0) return false;
-    if (
-      filter === "prazo_leilao" &&
-      !(
-        c.leilaoGarage &&
-        (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue")
-      )
-    ) {
-      return false;
-    }
-    if (filter === "inativos_grupo") {
-      const phone = c.phone_digits || normalizePhoneDigits(c.phone || "");
-      if (!phoneInSet(phone, silentGroupPhones)) return false;
-    }
-    return matchesCustomerQuery(c, q);
-  })
-    .sort((a, b) => {
-      if (filter !== "inativos_grupo") return 0;
-      const pa = normalizePhoneDigits(a.phone_digits || a.phone || "");
-      const pb = normalizePhoneDigits(b.phone_digits || b.phone || "");
-      const ma = lowActivityByPhone.get(pa) ?? 9999;
-      const mb = lowActivityByPhone.get(pb) ?? 9999;
+  const qNorm = useMemo(
+    () => normalizeSearchHay(search.trim()),
+    [search],
+  );
+  const qDigits = useMemo(
+    () => normalizePhoneDigits(search),
+    [search],
+  );
+
+  const matchesSearch = useCallback(
+    (hay: string, digits: string) => {
+      if (!qNorm && qDigits.length < 3) return true;
+      if (qDigits.length >= 3 && digits.includes(qDigits)) return true;
+      return qNorm ? hay.includes(qNorm) : true;
+    },
+    [qNorm, qDigits],
+  );
+
+  const filtered = useMemo(() => {
+    const rows = customers.filter((c) => {
+      if (filter === "ativos" && !c.hasOrders) return false;
+      if (filter === "sem_pedidos" && c.hasOrders) return false;
+      if (filter === "pendencias" && c.pendencias <= 0) return false;
+      if (
+        filter === "prazo_leilao" &&
+        !(
+          c.leilaoGarage &&
+          (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue")
+        )
+      ) {
+        return false;
+      }
+      if (filter === "inativos_grupo" && !c.silentInactive) return false;
+      return matchesSearch(c.searchHay, c.searchDigits);
+    });
+    if (filter !== "inativos_grupo") return rows;
+    return [...rows].sort((a, b) => {
+      const ma = lowActivityByPhone.get(a.searchDigits) ?? 9999;
+      const mb = lowActivityByPhone.get(b.searchDigits) ?? 9999;
       return ma - mb || a.name.localeCompare(b.name, "pt-BR");
     });
+  }, [customers, filter, matchesSearch, lowActivityByPhone]);
 
-  const inactiveUnregisteredFiltered = [...silentUnregistered]
-    .sort((a, b) => a.message_count - b.message_count)
-    .filter((r) =>
-      matchesCustomerQuery(
-        { name: r.name, phone: r.phone_digits, phone_digits: r.phone_digits },
-        q,
-      ),
-    );
+  const inactiveUnregisteredFiltered = useMemo(
+    () =>
+      [...silentUnregistered]
+        .sort((a, b) => a.message_count - b.message_count)
+        .filter((r) => matchesSearch(r.searchHay, r.phone_digits)),
+    [silentUnregistered, matchesSearch],
+  );
 
-  const counts = {
-    todos: customers.length,
-    ativos: customers.filter((c) => c.hasOrders).length,
-    sem_pedidos: customers.filter((c) => !c.hasOrders).length,
-    pendencias: customers.filter((c) => c.pendencias > 0).length,
-    prazo_leilao: customers.filter(
-      (c) =>
+  const counts = useMemo(() => {
+    let ativos = 0;
+    let semPedidos = 0;
+    let pendencias = 0;
+    let prazoLeilao = 0;
+    let inativosGrupo = 0;
+    for (const c of customers) {
+      if (c.hasOrders) ativos += 1;
+      else semPedidos += 1;
+      if (c.pendencias > 0) pendencias += 1;
+      if (
         c.leilaoGarage &&
-        (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue"),
-    ).length,
-    inativos_grupo:
-      customers.filter((c) => {
-        const phone = c.phone_digits || normalizePhoneDigits(c.phone || "");
-        return phoneInSet(phone, silentGroupPhones);
-      }).length + silentUnregistered.length,
-  };
+        (c.leilaoGarage.worst === "warn" || c.leilaoGarage.worst === "overdue")
+      ) {
+        prazoLeilao += 1;
+      }
+      if (c.silentInactive) inativosGrupo += 1;
+    }
+    return {
+      todos: customers.length,
+      ativos,
+      sem_pedidos: semPedidos,
+      pendencias,
+      prazo_leilao: prazoLeilao,
+      inativos_grupo: inativosGrupo + silentUnregistered.length,
+    };
+  }, [customers, silentUnregistered]);
+
+  const shown = filtered.slice(0, LIST_RENDER_LIMIT);
 
   return (
     <div>
@@ -719,12 +808,13 @@ export default function ClientesPage() {
         </p>
       ) : null}
 
-      <input
-        className="field mb-3 max-w-md"
-        placeholder="Buscar cliente..."
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-      />
+      <CustomerSearchField applied={search} onSearch={setSearch} />
+      {filtered.length > LIST_RENDER_LIMIT ? (
+        <p className="mb-3 text-sm text-zinc-600">
+          Mostrando {LIST_RENDER_LIMIT} de {filtered.length}. Digite mais no
+          campo de busca para achar o restante.
+        </p>
+      ) : null}
 
       {filtered.length === 0 &&
       !(filter === "inativos_grupo" && inactiveUnregisteredFiltered.length) ? (
@@ -736,7 +826,7 @@ export default function ClientesPage() {
               : "Importe o CSV do grupo ou cadastre manualmente."
           }
         />
-      ) : filtered.length > 0 ? (
+      ) : shown.length > 0 ? (
         <div className="table-wrap">
           <table className="data">
             <thead>
@@ -748,7 +838,7 @@ export default function ClientesPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((c) => (
+              {shown.map((c) => (
                 <tr key={c.id}>
                   <td
                     className={`font-medium ${c.pendencias ? "text-red-700" : ""}`}
@@ -766,11 +856,7 @@ export default function ClientesPage() {
                       {filter === "inativos_grupo" ? (
                         <Badge tone="warn">
                           {(
-                            lowActivityByPhone.get(
-                              normalizePhoneDigits(
-                                c.phone_digits || c.phone || "",
-                              ),
-                            ) ?? "?"
+                            lowActivityByPhone.get(c.searchDigits) ?? "?"
                           ).toString()}{" "}
                           msgs
                         </Badge>

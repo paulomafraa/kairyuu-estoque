@@ -1,16 +1,11 @@
 import { normalizePhoneDigits } from "@/lib/clients-csv";
-import { phonesMatch } from "@/lib/customers";
+import { buildPhoneLookup, phoneInLookup, phonesMatch } from "@/lib/customers";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 export { phonesMatch };
 
 export function phoneInSet(phone: string, set: Iterable<string>): boolean {
-  const d = normalizePhoneDigits(phone);
-  if (!d) return false;
-  for (const x of set) {
-    if (phonesMatch(d, x)) return true;
-  }
-  return false;
+  return phoneInLookup(phone, buildPhoneLookup(set));
 }
 
 async function fetchAllIds(
@@ -102,6 +97,7 @@ export function splitInactivePhones(
   phones: string[],
   protectedPhones: Set<string>,
 ): { inactive: string[]; active: string[] } {
+  const lookup = buildPhoneLookup(protectedPhones);
   const inactive: string[] = [];
   const active: string[] = [];
   const seen = new Set<string>();
@@ -109,7 +105,7 @@ export function splitInactivePhones(
     const d = normalizePhoneDigits(raw);
     if (!d || seen.has(d)) continue;
     seen.add(d);
-    if (phoneInSet(d, protectedPhones)) active.push(d);
+    if (phoneInLookup(d, lookup)) active.push(d);
     else inactive.push(d);
   }
   return { inactive, active };

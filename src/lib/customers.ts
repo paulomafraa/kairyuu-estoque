@@ -59,6 +59,27 @@ export function phonesMatch(a: string, b: string): boolean {
   return va.some((x) => vb.has(x));
 }
 
+/** Índice de variantes para lookup O(1) — não use phonesMatch em loop. */
+export function buildPhoneLookup(phones: Iterable<string>): Set<string> {
+  const out = new Set<string>();
+  for (const p of phones) {
+    for (const v of phoneVariants(p)) out.add(v);
+  }
+  return out;
+}
+
+export function phoneInLookup(phone: string, lookup: Set<string>): boolean {
+  if (!lookup.size) return false;
+  return phoneVariants(phone).some((v) => lookup.has(v));
+}
+
+export function normalizeSearchHay(raw: string): string {
+  return (raw || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "");
+}
+
 export function findCustomerByPhone(
   customers: Array<Pick<Customer, "id" | "phone" | "phone_digits">>,
   phone: string,
@@ -87,12 +108,10 @@ export function matchesCustomerQuery(
     const phone = customerPhoneDigits(c);
     if (phone.includes(qDigits)) return true;
   }
-  const hay = `${c.name || ""} ${c.phone || ""} ${c.phone_digits || ""}`
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "");
-  const qNorm = q.normalize("NFD").replace(/\p{M}/gu, "");
-  return hay.includes(qNorm);
+  const hay = normalizeSearchHay(
+    `${c.name || ""} ${c.phone || ""} ${c.phone_digits || ""}`,
+  );
+  return hay.includes(normalizeSearchHay(q));
 }
 
 /**
