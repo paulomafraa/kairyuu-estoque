@@ -3,6 +3,7 @@
 import Link from "next/link";
 import {
   FormEvent,
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -476,15 +477,22 @@ export default function EventoDetailPage() {
         ? customers.find((c) => c.id === line.customer_id)
         : undefined;
       const cust = byPhone || byId;
-      const key = cust?.id || phone || line.id;
-      const name = displayCustomerName(cust, line.customer_name_snapshot, phone);
+      const owned = saleLineHasOwner({
+        customer_id: cust?.id || line.customer_id,
+        phone: cust?.phone || phone,
+        phone_digits: phone,
+      });
+      const key = owned ? cust?.id || phone || line.id : "__sem_cliente__";
+      const name = owned
+        ? displayCustomerName(cust, line.customer_name_snapshot, phone)
+        : "Sem cliente";
       let p = byKey.get(key);
       if (!p) {
         p = {
           key,
-          customer_id: cust?.id || line.customer_id,
+          customer_id: owned ? cust?.id || line.customer_id || null : null,
           name,
-          phone: cust?.phone || phone,
+          phone: owned ? cust?.phone || phone : "",
           lines: [],
           unpaid: 0,
           urgency: "none",
@@ -509,6 +517,8 @@ export default function EventoDetailPage() {
       })
       .filter((p) => p.lines.some((l) => isActiveBillableSaleLine(l, kind)));
     list.sort((a, b) => {
+      if (a.key === "__sem_cliente__") return -1;
+      if (b.key === "__sem_cliente__") return 1;
       const rank = { overdue: 0, warn: 1, none: 2, ok: 3 };
       return rank[a.urgency] - rank[b.urgency] || a.name.localeCompare(b.name, "pt-BR");
     });
@@ -2219,7 +2229,12 @@ export default function EventoDetailPage() {
     const line = lines.find((l) => l.id === lineId);
     if (!line) return;
     const bucket = classifyStoredLeilaoLine(line);
-    if (!allowed.includes(bucket as "review" | "no_votes")) {
+    const orphan = !saleLineHasOwner({
+      customer_id: line.customer_id,
+      phone: line.customers?.phone,
+      phone_digits: line.phone_digits,
+    });
+    if (!orphan && !allowed.includes(bucket as "review" | "no_votes")) {
       setError("Esta carta não está na lista permitida para essa ação.");
       return;
     }
@@ -2602,8 +2617,11 @@ export default function EventoDetailPage() {
         import_status:
           line.import_status === "verificar_manual" ||
           line.import_status === "sem_voto"
-            ? "arrematado"
-            : line.import_status || "arrematado",
+            ? event?.kind === "encomenda"
+              ? "voto"
+              : "arrematado"
+            : line.import_status ||
+              (event?.kind === "encomenda" ? "voto" : "arrematado"),
         certainty: "certain",
       })
       .eq("id", lineId)
@@ -2613,9 +2631,16 @@ export default function EventoDetailPage() {
       setError(err.message);
       return;
     }
+    const wasOrphan = !saleLineHasOwner({
+      customer_id: line.customer_id,
+      phone: line.customers?.phone,
+      phone_digits: line.phone_digits,
+    });
     await logStaffAction(supabase, {
-      action: "change_owner",
-      detail: `Troca de dono · ${line.product_title} · de ${prevWho} → ${customer.name || phone} · motivo: ${motivo} · ${meName}`,
+      action: wasOrphan ? "owner_assign" : "change_owner",
+      detail: wasOrphan
+        ? `Associar dono · ${line.product_title} → ${customer.name || phone} · motivo: ${motivo} · ${meName}`
+        : `Troca de dono · ${line.product_title} · de ${prevWho} → ${customer.name || phone} · motivo: ${motivo} · ${meName}`,
       created_by: meId,
       entity_type: "event_sale_line",
       entity_id: lineId,
@@ -2623,12 +2648,15 @@ export default function EventoDetailPage() {
       event_id: eventId,
     });
     setInfo(
-      `Dono alterado: ${line.product_title} → ${customer.name || phone}`,
+      wasOrphan
+        ? `Associado: ${line.product_title} → ${customer.name || phone}`
+        : `Dono alterado: ${line.product_title} → ${customer.name || phone}`,
     );
     setReassignLineId(null);
     setReassignReason("");
     setReassignSearch("");
     setShowReassignNew(false);
+    if (customer.id) setSelectedParticipant(customer.id);
     await load();
   }
 
@@ -4491,6 +4519,13 @@ export default function EventoDetailPage() {
             </button>
           ) : null}
           </div>
+          {event.kind === "encomenda" && ownerlessLines.length > 0 ? (
+            <p className="mb-2 text-xs text-zinc-600">
+              Cartas que o bot não identificou ficam juntas em{" "}
+              <strong>Sem cliente</strong>. Abra essa ficha e use{" "}
+              <strong>Associar dono</strong> em cada carta.
+            </p>
+          ) : null}
           {participants.length === 0 ? (
             <EmptyState
               title="Ninguém ainda"
@@ -4548,7 +4583,13 @@ export default function EventoDetailPage() {
                   <li key={p.key}>
                     <button
                       type="button"
-                      className={`flex w-full items-center justify-between rounded-md px-3 py-2.5 text-left text-sm ${participantFlowCardClass(flowStage, selected)}`}
+                      className={`flex w-full items-center justify-between rounded-md px-3 py-2.5 text-left text-sm ${
+                        p.key === "__sem_cliente__"
+                          ? selected
+                            ? "bg-rose-800 text-white ring-2 ring-rose-950"
+                            : "bg-rose-50 text-rose-950 hover:bg-rose-100"
+                          : participantFlowCardClass(flowStage, selected)
+                      }`}
                       onClick={() => {
                         setSelectedParticipant(p.key);
                         setSelectedLineIds({});
@@ -4633,7 +4674,10 @@ export default function EventoDetailPage() {
                     className="btn-secondary px-2 py-1 text-xs"
                     title="Copia a mensagem de cobrança (não aparece na tela)"
                     onClick={() => void copyBillingMessage()}
-                    disabled={activeMainLines.length === 0}
+                    disabled={
+                      activeMainLines.length === 0 ||
+                      !activeParticipant.customer_id
+                    }
                   >
                     Copiar cobrança
                   </button>
@@ -4655,6 +4699,15 @@ export default function EventoDetailPage() {
                   ) : null}
                 </div>
               </div>
+
+              {activeParticipant.key === "__sem_cliente__" ? (
+                <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+                  O bot não identificou o dono destas cartas. Em cada linha,
+                  clique em <strong>Associar dono</strong>, busque o cliente
+                  (nome ou telefone) e confirme. O motivo já vem preenchido
+                  para auditoria.
+                </p>
+              ) : null}
 
               <div className="flex flex-wrap items-center gap-2">
                 <button
@@ -4793,8 +4846,16 @@ export default function EventoDetailPage() {
                     <tbody>
                       {activeMainLines.map((line) => {
                         const price = lineUnitPrice(line);
+                        const lineOrphan = !saleLineHasOwner({
+                          customer_id: line.customer_id,
+                          phone: line.customers?.phone,
+                          phone_digits: line.phone_digits,
+                        });
+                        const canAssign =
+                          lineOrphan && !line.paid && !line.garage_item_id;
                         return (
-                          <tr key={line.id}>
+                          <Fragment key={line.id}>
+                          <tr>
                             <td>
                               <input
                                 type="checkbox"
@@ -4816,15 +4877,39 @@ export default function EventoDetailPage() {
                                   ? " · revisão"
                                   : ""}
                               </div>
+                              <div className="mt-1 flex flex-wrap gap-x-2">
                               <button
                                 type="button"
-                                className="mt-1 text-xs font-medium text-sky-800 underline"
+                                className="text-xs font-medium text-sky-800 underline"
                                 disabled={busy}
                                 title="Cria outra unidade sem dono"
                                 onClick={() => void duplicateSaleLine(line)}
                               >
                                 Duplicar
                               </button>
+                              {canAssign ? (
+                                <button
+                                  type="button"
+                                  className="text-xs font-medium text-amber-800 underline"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    const open = reassignLineId !== line.id;
+                                    setReassignLineId(open ? line.id : null);
+                                    setReassignReason(
+                                      open
+                                        ? "Bot não identificou o dono"
+                                        : "",
+                                    );
+                                    setReassignSearch("");
+                                    setShowReassignNew(false);
+                                  }}
+                                >
+                                  {reassignLineId === line.id
+                                    ? "Cancelar"
+                                    : "Associar dono"}
+                                </button>
+                              ) : null}
+                              </div>
                             </td>
                             <td>
                               <input
@@ -4957,6 +5042,158 @@ export default function EventoDetailPage() {
                               )}
                             </td>
                           </tr>
+                          {reassignLineId === line.id && canAssign ? (
+                            <tr>
+                              <td colSpan={5} className="bg-amber-50/70">
+                                <div className="space-y-2 rounded-md border border-amber-200 p-2">
+                                  <p className="text-xs text-amber-950">
+                                    Busque o cliente e confirme. Motivo vai
+                                    para a Auditoria.
+                                  </p>
+                                  <textarea
+                                    className="field min-h-16 text-sm"
+                                    placeholder="Motivo da associação…"
+                                    value={reassignReason}
+                                    onChange={(e) =>
+                                      setReassignReason(e.target.value)
+                                    }
+                                    required
+                                  />
+                                  <div className="flex flex-wrap gap-1 text-xs">
+                                    <button
+                                      type="button"
+                                      className={
+                                        reassignScope === "event"
+                                          ? "btn-primary px-2 py-1 text-xs"
+                                          : "btn-secondary px-2 py-1 text-xs"
+                                      }
+                                      onClick={() => setReassignScope("event")}
+                                    >
+                                      Deste evento
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className={
+                                        reassignScope === "all"
+                                          ? "btn-primary px-2 py-1 text-xs"
+                                          : "btn-secondary px-2 py-1 text-xs"
+                                      }
+                                      onClick={() => setReassignScope("all")}
+                                    >
+                                      Todos
+                                    </button>
+                                  </div>
+                                  <input
+                                    className="field text-sm"
+                                    placeholder="Buscar nome ou telefone…"
+                                    value={reassignSearch}
+                                    onChange={(e) =>
+                                      setReassignSearch(e.target.value)
+                                    }
+                                  />
+                                  <ul className="max-h-32 space-y-1 overflow-y-auto">
+                                    {(reassignScope === "event"
+                                      ? participants
+                                          .map((p) => {
+                                            if (!p.customer_id) return null;
+                                            const existing = customers.find(
+                                              (c) => c.id === p.customer_id,
+                                            );
+                                            if (existing) return existing;
+                                            return {
+                                              id: p.customer_id,
+                                              name: p.name,
+                                              phone: p.phone,
+                                              phone_digits:
+                                                normalizePhoneDigits(p.phone),
+                                              notes: "",
+                                              created_at: "",
+                                            } as Customer;
+                                          })
+                                          .filter(Boolean)
+                                      : customers
+                                    )
+                                      .filter((c): c is Customer => {
+                                        if (!c || c.id === line.customer_id)
+                                          return false;
+                                        return matchesCustomerQuery(
+                                          c,
+                                          reassignSearch,
+                                        );
+                                      })
+                                      .slice(0, 30)
+                                      .map((c) => (
+                                        <li key={c.id}>
+                                          <button
+                                            type="button"
+                                            className="flex w-full items-center justify-between rounded px-2 py-1 text-left text-xs hover:bg-white"
+                                            disabled={busy}
+                                            onClick={() =>
+                                              void changeLineOwner(
+                                                line.id,
+                                                c,
+                                                reassignReason,
+                                              )
+                                            }
+                                          >
+                                            <span>
+                                              {labelWithPhone(
+                                                c.name,
+                                                c.phone || "",
+                                              )}
+                                            </span>
+                                            <span className="text-emerald-700">
+                                              Confirmar
+                                            </span>
+                                          </button>
+                                        </li>
+                                      ))}
+                                  </ul>
+                                  {!showReassignNew ? (
+                                    <button
+                                      type="button"
+                                      className="btn-secondary w-full text-xs"
+                                      onClick={() => setShowReassignNew(true)}
+                                    >
+                                      Novo cliente + associar
+                                    </button>
+                                  ) : (
+                                    <div className="space-y-1">
+                                      <input
+                                        className="field text-sm"
+                                        placeholder="Nome"
+                                        value={reassignNewName}
+                                        onChange={(e) =>
+                                          setReassignNewName(e.target.value)
+                                        }
+                                      />
+                                      <input
+                                        className="field text-sm"
+                                        placeholder="Telefone"
+                                        value={reassignNewPhone}
+                                        onChange={(e) =>
+                                          setReassignNewPhone(e.target.value)
+                                        }
+                                      />
+                                      <button
+                                        type="button"
+                                        className="btn-primary w-full text-xs"
+                                        disabled={busy}
+                                        onClick={() =>
+                                          void createCustomerAndChangeOwner(
+                                            line.id,
+                                          )
+                                        }
+                                      >
+                                        Criar e associar
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          ) : null}
+                          </Fragment>
                         );
                       })}
                     </tbody>
