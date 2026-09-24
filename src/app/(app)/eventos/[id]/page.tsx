@@ -315,9 +315,9 @@ export default function EventoDetailPage() {
   const [productCosts, setProductCosts] = useState<EventProductCost[]>([]);
   const [cardSort, setCardSort] = useState<CardSortMode>("enquete");
   const [cardOrder, setCardOrder] = useState<Record<string, number>>({});
-  const [orphanDeleteOpen, setOrphanDeleteOpen] = useState(false);
-  const [orphanDeleteReason, setOrphanDeleteReason] = useState("");
-  const [orphanDeleteIds, setOrphanDeleteIds] = useState<string[]>([]);
+  const [lineDeleteOpen, setLineDeleteOpen] = useState(false);
+  const [lineDeleteReason, setLineDeleteReason] = useState("");
+  const [lineDeleteIds, setLineDeleteIds] = useState<string[]>([]);
   const [controlReason, setControlReason] = useState("");
   const [orphanLineId, setOrphanLineId] = useState<string | null>(null);
   const [orphanSearch, setOrphanSearch] = useState("");
@@ -1768,24 +1768,24 @@ export default function EventoDetailPage() {
     }
   }
 
-  function openOrphanDelete(ids: string[]) {
+  function openLineDelete(ids: string[]) {
     if (!ids.length) return;
-    setOrphanDeleteIds(ids);
-    setOrphanDeleteReason("");
-    setOrphanDeleteOpen(true);
+    setLineDeleteIds(ids);
+    setLineDeleteReason("");
+    setLineDeleteOpen(true);
     setError(null);
   }
 
-  async function confirmOrphanDelete() {
-    const reason = orphanDeleteReason.trim();
+  async function confirmLineDelete() {
+    const reason = lineDeleteReason.trim();
     if (reason.length < 3) {
       setError("Escreva o motivo na caixa de observação (obrigatório).");
       return;
     }
-    await cancelLines(orphanDeleteIds, reason);
-    setOrphanDeleteOpen(false);
-    setOrphanDeleteReason("");
-    setOrphanDeleteIds([]);
+    await cancelLines(lineDeleteIds, reason);
+    setLineDeleteOpen(false);
+    setLineDeleteReason("");
+    setLineDeleteIds([]);
   }
 
   function selectedIdsFromParticipant(): string[] {
@@ -1987,29 +1987,6 @@ export default function EventoDetailPage() {
     if (typeof window !== "undefined") {
       requestAnimationFrame(() => window.scrollTo({ top: y }));
     }
-  }
-
-  async function removeVoteFromProduct(lineId: string) {
-    const line = lines.find((l) => l.id === lineId);
-    if (!line) return;
-    if (line.paid || line.garage_item_id) {
-      setError(
-        "Esse pedido já está pago ou na caixinha — não dá para excluir por aqui.",
-      );
-      return;
-    }
-    await withScrollKeep(async () => {
-      await patchLines(
-        [lineId],
-        {
-          cancelled: true,
-          cancel_reason: "Removido da carta (correção de voto)",
-          cancelled_at: new Date().toISOString(),
-          cancelled_by: meId,
-        },
-        "Removido da carta",
-      );
-    });
   }
 
   async function addCustomerToProduct(
@@ -4194,7 +4171,6 @@ export default function EventoDetailPage() {
                             "Sem cliente";
                           const phone =
                             line.customers?.phone || line.phone_digits || "";
-                          const canRemove = !line.paid && !line.garage_item_id;
                           const lineQty =
                             Number(line.qty) > 0 ? Number(line.qty) : 1;
                           const lineArrived = Math.max(
@@ -4297,17 +4273,15 @@ export default function EventoDetailPage() {
                                     </span>
                                   </label>
                                 )}
-                                {canRemove ? (
-                                  <ConfirmButton
-                                    label="Excluir"
-                                    confirmLabel="Confirmar exclusão?"
-                                    className="text-xs font-medium text-red-700 underline decoration-red-200 underline-offset-2"
-                                    disabled={busy}
-                                    onConfirm={() =>
-                                      removeVoteFromProduct(line.id)
-                                    }
-                                  />
-                                ) : null}
+                                <button
+                                  type="button"
+                                  className="text-xs font-medium text-red-700 underline decoration-red-200 underline-offset-2"
+                                  disabled={busy}
+                                  title="Tira este pedido da carta. Motivo obrigatório."
+                                  onClick={() => openLineDelete([line.id])}
+                                >
+                                  Excluir
+                                </button>
                               </div>
                             </li>
                           );
@@ -4513,7 +4487,7 @@ export default function EventoDetailPage() {
               type="button"
               className="btn-danger px-2 py-1 text-xs"
               disabled={busy}
-              onClick={() => openOrphanDelete(ownerlessLines.map((l) => l.id))}
+              onClick={() => openLineDelete(ownerlessLines.map((l) => l.id))}
             >
               Excluir {ownerlessLines.length} sem dono
             </button>
@@ -4778,10 +4752,21 @@ export default function EventoDetailPage() {
                     className="btn-danger"
                     disabled={busy || activeMainLines.length === 0}
                     onClick={() =>
-                      openOrphanDelete(activeMainLines.map((l) => l.id))
+                      openLineDelete(activeMainLines.map((l) => l.id))
                     }
                   >
                     Excluir carta sem dono
+                  </button>
+                ) : event.kind === "encomenda" ? (
+                  <button
+                    type="button"
+                    className="btn-danger"
+                    disabled={busy || selectedCount === 0}
+                    onClick={() =>
+                      openLineDelete(selectedIdsFromParticipant())
+                    }
+                  >
+                    Excluir carta
                   </button>
                 ) : (
                   <ConfirmButton
@@ -4802,7 +4787,7 @@ export default function EventoDetailPage() {
                           })
                         );
                       });
-                      if (allOrphan) openOrphanDelete(ids);
+                      if (allOrphan) openLineDelete(ids);
                       else void cancelLines(ids);
                     }}
                   />
@@ -4907,6 +4892,17 @@ export default function EventoDetailPage() {
                                   {reassignLineId === line.id
                                     ? "Cancelar"
                                     : "Associar dono"}
+                                </button>
+                              ) : null}
+                              {event.kind === "encomenda" ? (
+                                <button
+                                  type="button"
+                                  className="text-xs font-medium text-red-700 underline"
+                                  disabled={busy}
+                                  title="Tira a carta da rodada. Motivo obrigatório."
+                                  onClick={() => openLineDelete([line.id])}
+                                >
+                                  Excluir
                                 </button>
                               ) : null}
                               </div>
@@ -5477,27 +5473,54 @@ export default function EventoDetailPage() {
         </section>
       ) : null}
 
-      {orphanDeleteOpen ? (
+      {lineDeleteOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div
             role="dialog"
             aria-modal="true"
             className="w-full max-w-md rounded-lg bg-white p-4 shadow-xl"
           >
+            {(() => {
+              const targets = lines.filter((l) => lineDeleteIds.includes(l.id));
+              const ownedCount = targets.filter((l) =>
+                saleLineHasOwner({
+                  customer_id: l.customer_id,
+                  phone: l.customers?.phone,
+                  phone_digits: l.phone_digits,
+                }),
+              ).length;
+              const hasGarage = targets.some(
+                (l) => l.paid || l.garage_item_id,
+              );
+              const title =
+                targets.length === 1
+                  ? `Excluir ${targets[0].product_title}`
+                  : `Excluir ${targets.length} carta(s)`;
+              return (
+                <>
             <h2 className="text-base font-semibold text-zinc-900">
-              Excluir carta(s) sem dono
+              {title}
             </h2>
             <p className="mt-2 text-sm text-zinc-600">
-              {orphanDeleteIds.length} carta(s) sem cliente. Isso tira elas da
-              rodada e do a receber. Escreva o motivo (obrigatório).
+              {ownedCount > 0
+                ? "A carta sai da rodada, do resumo e do a receber do cliente. Escreva o motivo (obrigatório)."
+                : "Carta(s) sem cliente. Isso tira elas da rodada e do a receber. Escreva o motivo (obrigatório)."}
             </p>
+            {hasGarage ? (
+              <p className="mt-2 text-sm text-amber-800">
+                Item já pago ou na caixinha também será cancelado.
+              </p>
+            ) : null}
+                </>
+              );
+            })()}
             <label className="mt-3 block text-sm">
               <span className="mb-1 block text-zinc-600">Observação / motivo</span>
               <textarea
                 className="field min-h-24"
-                value={orphanDeleteReason}
-                onChange={(e) => setOrphanDeleteReason(e.target.value)}
-                placeholder="Ex.: enquete sem voto, bot não leu o dono, carta de teste…"
+                value={lineDeleteReason}
+                onChange={(e) => setLineDeleteReason(e.target.value)}
+                placeholder="Ex.: cliente desistiu, voto errado, carta de teste…"
               />
             </label>
             <div className="mt-4 flex flex-wrap justify-end gap-2">
@@ -5506,9 +5529,9 @@ export default function EventoDetailPage() {
                 className="btn-secondary"
                 disabled={busy}
                 onClick={() => {
-                  setOrphanDeleteOpen(false);
-                  setOrphanDeleteReason("");
-                  setOrphanDeleteIds([]);
+                  setLineDeleteOpen(false);
+                  setLineDeleteReason("");
+                  setLineDeleteIds([]);
                 }}
               >
                 Voltar
@@ -5516,8 +5539,8 @@ export default function EventoDetailPage() {
               <button
                 type="button"
                 className="btn-danger"
-                disabled={busy || orphanDeleteReason.trim().length < 3}
-                onClick={() => void confirmOrphanDelete()}
+                disabled={busy || lineDeleteReason.trim().length < 3}
+                onClick={() => void confirmLineDelete()}
               >
                 Excluir
               </button>
