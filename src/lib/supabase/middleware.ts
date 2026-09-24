@@ -9,9 +9,9 @@ export async function updateSession(request: NextRequest) {
   const path = request.nextUrl.pathname;
 
   if (!url || !key) {
-    if (path !== "/setup") {
+    if (path !== "/login") {
       const redirect = request.nextUrl.clone();
-      redirect.pathname = "/setup";
+      redirect.pathname = "/login";
       return NextResponse.redirect(redirect);
     }
     return supabaseResponse;
@@ -39,12 +39,11 @@ export async function updateSession(request: NextRequest) {
   } = await supabase.auth.getUser();
 
   const isLogin = path === "/login";
-  const isSetup = path === "/setup";
   const isHome = path === "/";
   // APIs com auth própria (chave do bot / fluxo de signup)
   const isOpenApi =
     path.startsWith("/api/bot/") || path.startsWith("/api/auth/");
-  const isPublic = isLogin || isSetup || isHome || isOpenApi;
+  const isPublic = isLogin || isOpenApi;
 
   if (!user && !isPublic) {
     const redirect = request.nextUrl.clone();
@@ -52,7 +51,7 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(redirect);
   }
 
-  if (user && (isLogin || isHome)) {
+  if (user && (isLogin || isHome || path === "/setup")) {
     const redirect = request.nextUrl.clone();
     redirect.pathname = "/estoque";
     return NextResponse.redirect(redirect);

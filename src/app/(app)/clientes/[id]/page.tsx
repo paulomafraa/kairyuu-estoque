@@ -142,6 +142,7 @@ export default function ClienteDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [openEventIds, setOpenEventIds] = useState<Record<string, boolean>>({});
 
   const [editName, setEditName] = useState("");
   const [editingName, setEditingName] = useState(false);
@@ -895,6 +896,7 @@ export default function ClienteDetailPage() {
         kind: string;
         openItems: number;
         paidItems: number;
+        items: ChargeLine[];
       }
     >();
     for (const line of chargeLines) {
@@ -914,9 +916,11 @@ export default function ClienteDetailPage() {
           kind,
           openItems: 0,
           paidItems: 0,
+          items: [],
         };
         byId.set(eventId, row);
       }
+      row.items.push(line);
       if (line.paid) row.paidItems += 1;
       else row.openItems += 1;
     }
@@ -1502,29 +1506,94 @@ export default function ClienteDetailPage() {
             <h3 className="mb-2 text-sm font-semibold text-zinc-800">
               Eventos deste cliente ({eventHistory.length})
             </h3>
-            <ul className="flex flex-wrap gap-2">
-              {eventHistory.map((ev) => (
-                <li key={ev.eventId}>
-                  <Link
-                    href={`/eventos/${ev.eventId}`}
-                    className="inline-flex items-center gap-2 rounded-md border border-zinc-200 bg-white px-2.5 py-1.5 text-xs hover:bg-zinc-50"
+            <ul className="flex flex-col gap-2">
+              {eventHistory.map((ev) => {
+                const open = Boolean(openEventIds[ev.eventId]);
+                const kindLabel =
+                  ev.kind === "leilao"
+                    ? "Leilão"
+                    : ev.kind === "encomenda"
+                      ? "Encomenda"
+                      : ev.kind;
+                return (
+                  <li
+                    key={ev.eventId}
+                    className="rounded-md border border-zinc-200 bg-white"
                   >
-                    <span className="font-medium text-zinc-900">
-                      {ev.kind === "leilao"
-                        ? "Leilão"
-                        : ev.kind === "encomenda"
-                          ? "Encomenda"
-                          : ev.kind}{" "}
-                      · {fmtDay(ev.eventDate)}
-                    </span>
-                    <span className="text-zinc-500">
-                      {ev.openItems > 0
-                        ? `${ev.openItems} em aberto`
-                        : `${ev.paidItems} pago(s)`}
-                    </span>
-                  </Link>
-                </li>
-              ))}
+                    <div className="flex items-stretch">
+                      <Link
+                        href={`/eventos/${ev.eventId}`}
+                        className="flex min-w-0 flex-1 items-center justify-between gap-2 px-2.5 py-1.5 text-xs hover:bg-zinc-50"
+                      >
+                        <span className="font-medium text-zinc-900">
+                          {kindLabel} · {fmtDay(ev.eventDate)}
+                        </span>
+                        <span className="shrink-0 text-zinc-500">
+                          {ev.openItems > 0
+                            ? `${ev.openItems} em aberto`
+                            : `${ev.paidItems} pago(s)`}
+                        </span>
+                      </Link>
+                      <button
+                        type="button"
+                        className="border-l border-zinc-200 px-2 text-zinc-600 hover:bg-zinc-50"
+                        aria-expanded={open}
+                        aria-label={
+                          open
+                            ? `Recolher itens de ${kindLabel} ${fmtDay(ev.eventDate)}`
+                            : `Ver itens de ${kindLabel} ${fmtDay(ev.eventDate)}`
+                        }
+                        onClick={() =>
+                          setOpenEventIds((prev) => ({
+                            ...prev,
+                            [ev.eventId]: !prev[ev.eventId],
+                          }))
+                        }
+                      >
+                        <span
+                          className={`inline-block text-[10px] leading-none transition-transform ${open ? "rotate-180" : ""}`}
+                          aria-hidden
+                        >
+                          ▼
+                        </span>
+                      </button>
+                    </div>
+                    {open ? (
+                      <ul className="border-t border-zinc-100 px-2.5 py-2">
+                        {ev.items.map((line) => {
+                          const qty =
+                            Number(line.qty) > 0 ? Number(line.qty) : 1;
+                          const price = lineUnitPrice(line);
+                          return (
+                            <li
+                              key={line.id}
+                              className="flex items-start justify-between gap-3 py-1 text-xs"
+                            >
+                              <span className="min-w-0 text-zinc-800">
+                                {line.product_title}
+                                {qty > 1 ? (
+                                  <span className="text-zinc-500">
+                                    {" "}
+                                    ×{qty}
+                                  </span>
+                                ) : null}
+                              </span>
+                              <span className="shrink-0 text-right text-zinc-600">
+                                {price != null
+                                  ? `R$ ${formatMoneyBr(price * qty)}`
+                                  : "R$ ?"}
+                                <span className="ml-2 text-zinc-400">
+                                  {line.paid ? "pago" : "em aberto"}
+                                </span>
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         ) : null}

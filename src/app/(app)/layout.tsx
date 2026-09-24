@@ -10,7 +10,7 @@ export default async function AppLayout({
   children: React.ReactNode;
 }) {
   if (!isSupabaseConfigured()) {
-    redirect("/setup");
+    redirect("/login");
   }
 
   const supabase = await createClient();

@@ -2,7 +2,6 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 
 type Mode = "login" | "signup";
@@ -253,14 +252,6 @@ export default function LoginPage() {
         {mode === "login" ? "Pedir criação de conta (staff)" : "Já tenho conta"}
       </button>
 
-      <div className="mt-6 flex flex-col gap-2 text-sm text-zinc-500">
-        <Link href="/" className="underline">
-          Sobre o projeto
-        </Link>
-        <Link href="/setup" className="underline">
-          Ver passos de configuração
-        </Link>
-      </div>
     </main>
   );
 }
