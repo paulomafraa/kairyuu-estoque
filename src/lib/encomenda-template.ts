@@ -59,13 +59,44 @@ export function normalizeProductKey(title: string): string {
   return productMatchKey(title);
 }
 
-function parseMoneyCell(raw: string): number | null {
+/**
+ * Aceita BR (`20,00` / `2.000,00`) e US/Excel (`20.00` / `2,000.00`).
+ * Ponto ou vírgula com 1–2 dígitos no fim = decimal; 3 dígitos = milhar.
+ */
+export function parseMoneyCell(raw: string): number | null {
   const t = (raw || "").trim();
   if (!t || t === "-" || /^R\$\s*-?\s*$/i.test(t)) return null;
-  const m = t.match(/([\d.]+(?:,\d{1,2})?)/);
+  const m = t.match(/-?[\d.,]+/);
   if (!m) return null;
-  const n = Number(m[1].replace(/\./g, "").replace(",", "."));
+  let s = m[0];
+  const lastComma = s.lastIndexOf(",");
+  const lastDot = s.lastIndexOf(".");
+  if (lastComma >= 0 && lastDot >= 0) {
+    s =
+      lastComma > lastDot
+        ? s.replace(/\./g, "").replace(",", ".")
+        : s.replace(/,/g, "");
+  } else if (lastComma >= 0) {
+    const frac = s.length - lastComma - 1;
+    s =
+      frac === 3 && s.indexOf(",") === lastComma
+        ? s.replace(/,/g, "")
+        : s.replace(",", ".");
+  } else if (lastDot >= 0) {
+    const frac = s.length - lastDot - 1;
+    const dots = (s.match(/\./g) || []).length;
+    if (dots > 1 || frac === 3) s = s.replace(/\./g, "");
+  }
+  const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+function moneyFromCell(cell: unknown): number | null {
+  if (typeof cell === "number") {
+    return Number.isFinite(cell) ? cell : null;
+  }
+  if (cell == null) return null;
+  return parseMoneyCell(String(cell));
 }
 
 function splitCsvLine(line: string): string[] {
@@ -202,7 +233,8 @@ function parseSheetMatrix(matrix: unknown[][]): EncomendaCostRow[] {
   let started = false;
   let sort = 0;
   for (let r = 0; r < matrix.length; r++) {
-    const line = (matrix[r] || []).map((c) => String(c ?? "").trim());
+    const row = matrix[r] || [];
+    const line = row.map((c) => String(c ?? "").trim());
     const nome = (line[0] || "").replace(/\s+/g, " ").trim();
     if (!nome) continue;
     if (/^carta$/i.test(nome)) {
@@ -211,9 +243,9 @@ function parseSheetMatrix(matrix: unknown[][]): EncomendaCostRow[] {
       continue;
     }
     started = true;
-    const cost_jp = parseMoneyCell(line[1] || "");
-    const price_sale = parseMoneyCell(line[2] || "");
-    const price_liga = parseMoneyCell(line[3] || "");
+    const cost_jp = moneyFromCell(row[1]);
+    const price_sale = moneyFromCell(row[2]);
+    const price_liga = moneyFromCell(row[3]);
     const link = (line[4] || "").trim();
     if (price_sale == null && cost_jp == null && !link) continue;
     sort += 1;
@@ -263,7 +295,7 @@ export async function parseEncomendaXlsx(
     const matrix = (XLSX.utils.sheet_to_json(sheet, {
       header: 1,
       defval: "",
-      raw: false,
+      raw: true,
     }) || []) as unknown[][];
     const score = scoreRoundSheet(name, matrix.length, hint);
     if (score > bestScore) {
@@ -275,7 +307,7 @@ export async function parseEncomendaXlsx(
   const matrix = (XLSX.utils.sheet_to_json(wb.Sheets[best], {
     header: 1,
     defval: "",
-    raw: false,
+    raw: true,
   }) || []) as unknown[][];
   return {
     rows: parseSheetMatrix(matrix),
