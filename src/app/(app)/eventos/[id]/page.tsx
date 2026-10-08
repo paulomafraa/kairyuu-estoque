@@ -1115,7 +1115,9 @@ export default function EventoDetailPage() {
           poll_created_at: row.poll_created_at || null,
           notes:
             row.import_status === "verificar_manual"
-              ? "Revisão manual (❓) — bot não definiu ganhador"
+              ? event?.kind === "encomenda"
+                ? "Revisão ❓ — clique visto, opção não lida"
+                : "Revisão manual (❓) — bot não definiu ganhador"
               : row.import_status === "sem_voto"
                 ? "Sem votos na enquete"
                 : "",
@@ -3084,11 +3086,10 @@ export default function EventoDetailPage() {
             <p className="text-sm text-zinc-600">
               {event.kind === "encomenda" ? (
                 <>
-                  Em <strong>encomenda</strong> entram votos em{" "}
-                  <strong>Eu quero…</strong> e linhas de <strong>revisão ❓</strong>{" "}
-                  (clique que o bot não leu). A opção 💙 é ignorada. Vários
-                  clientes na mesma carta entram normalmente. Reimportar só
-                  adiciona quem ainda faltava.
+                  Em <strong>encomenda</strong> não tem dono único: entra{" "}
+                  <strong>cada voto</strong> em <strong>Eu quero…</strong> (várias
+                  pessoas na mesma carta). ❓ = clique daquela pessoa sem opção
+                  lida. 💙 fica de fora. Reimportar só adiciona quem faltava.
                 </>
               ) : event.kind === "leilao" ? (
                 <>
@@ -3123,7 +3124,9 @@ export default function EventoDetailPage() {
                 <div className="grid gap-3 sm:grid-cols-3">
                   <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2">
                     <div className="font-semibold text-emerald-900">
-                      Dono certo ({importPreview.certain.length})
+                      {event.kind === "encomenda"
+                        ? `Pedidos Eu quero… (${importPreview.certain.length})`
+                        : `Dono certo (${importPreview.certain.length})`}
                     </div>
                     <ul className="mt-1 max-h-32 overflow-y-auto overscroll-contain text-xs text-emerald-900/80">
                       {importPreview.certain.slice(0, 40).map((l, i) => (
@@ -3141,14 +3144,23 @@ export default function EventoDetailPage() {
                   </div>
                   <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2">
                     <div className="font-semibold text-amber-900">
-                      Revisão ❓ ({importPreview.review.length})
+                      {event.kind === "encomenda"
+                        ? `Cliques ❓ (${importPreview.review.length})`
+                        : `Revisão ❓ (${importPreview.review.length})`}
                     </div>
                     <p className="text-xs text-amber-800/80">
-                      Teve voto, mas o bot não definiu o ganhador.
+                      {event.kind === "encomenda"
+                        ? "Pessoa clicou, o bot não leu se foi Eu quero ou 💙."
+                        : "Teve voto, mas o bot não definiu o ganhador."}
                     </p>
                     <ul className="mt-1 max-h-32 overflow-y-auto overscroll-contain text-xs text-amber-900/80">
                       {importPreview.review.slice(0, 40).map((l, i) => (
-                        <li key={`r-${i}`}>{l.product_title}</li>
+                        <li key={`r-${i}`}>
+                          {l.product_title}
+                          {l.customer_name_snapshot
+                            ? ` · ${l.customer_name_snapshot}`
+                            : ""}
+                        </li>
                       ))}
                       {importPreview.review.length > 40 ? (
                         <li>… +{importPreview.review.length - 40}</li>
