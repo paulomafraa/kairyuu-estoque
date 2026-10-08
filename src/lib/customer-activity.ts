@@ -31,6 +31,79 @@ async function fetchAllIds(
   return out;
 }
 
+async function fetchSaleLinePhones(
+  supabase: SupabaseClient,
+): Promise<Set<string>> {
+  const pageSize = 1000;
+  const phones = new Set<string>();
+  for (let from = 0; from < 200000; from += pageSize) {
+    const { data, error } = await supabase
+      .from("event_sale_lines")
+      .select("phone_digits")
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const batch = (data || []) as Array<{ phone_digits: string | null }>;
+    for (const line of batch) {
+      const d = normalizePhoneDigits(line.phone_digits || "");
+      if (d) phones.add(d);
+    }
+    if (batch.length < pageSize) break;
+  }
+  return phones;
+}
+
+/**
+ * Cadastro (customers) + compras.
+ * `purchased` = qualquer pedido: linha de venda (leilão / encomenda / evento),
+ * `orders`, `customer_items` ou `customer_garage_items` do cliente.
+ */
+export async function fetchCustomerPhoneSets(
+  supabase: SupabaseClient,
+): Promise<{ protected: Set<string>; purchased: Set<string> }> {
+  const [salePhones, customers, orderCustomers, itemCustomers, garageCustomers] =
+    await Promise.all([
+      fetchSaleLinePhones(supabase),
+      (async () => {
+        const pageSize = 1000;
+        const rows: Array<{
+          id: string;
+          phone_digits: string | null;
+          phone: string | null;
+        }> = [];
+        for (let from = 0; from < 100000; from += pageSize) {
+          const { data, error } = await supabase
+            .from("customers")
+            .select("id, phone_digits, phone")
+            .order("id")
+            .range(from, from + pageSize - 1);
+          if (error) throw error;
+          const batch = (data || []) as typeof rows;
+          rows.push(...batch);
+          if (batch.length < pageSize) break;
+        }
+        return rows;
+      })(),
+      fetchAllIds(supabase, "orders", "customer_id"),
+      fetchAllIds(supabase, "customer_items", "customer_id"),
+      fetchAllIds(supabase, "customer_garage_items", "customer_id"),
+    ]);
+
+  const buyerIds = new Set<string>([
+    ...orderCustomers,
+    ...itemCustomers,
+    ...garageCustomers,
+  ]);
+  const purchased = new Set<string>(salePhones);
+  const protectedPhones = new Set<string>(salePhones);
+  for (const c of customers) {
+    const d = normalizePhoneDigits(c.phone_digits || c.phone || "");
+    if (!d) continue;
+    protectedPhones.add(d);
+    if (buyerIds.has(c.id)) purchased.add(d);
+  }
+  return { protected: protectedPhones, purchased };
+}
+
 /**
  * Telefones “protegidos” (não entram como inativos do grupo):
  * - qualquer cadastro em `customers` (só estar no site já conta)
@@ -39,51 +112,14 @@ async function fetchAllIds(
 export async function fetchProtectedCustomerPhones(
   supabase: SupabaseClient,
 ): Promise<Set<string>> {
-  const [saleLines, customers] = await Promise.all([
-    (async () => {
-      const pageSize = 1000;
-      const rows: Array<{ phone_digits: string | null }> = [];
-      for (let from = 0; from < 200000; from += pageSize) {
-        const { data, error } = await supabase
-          .from("event_sale_lines")
-          .select("phone_digits")
-          .range(from, from + pageSize - 1);
-        if (error) throw error;
-        const batch = (data || []) as typeof rows;
-        rows.push(...batch);
-        if (batch.length < pageSize) break;
-      }
-      return rows;
-    })(),
-    (async () => {
-      const pageSize = 1000;
-      const rows: Array<{ phone_digits: string | null; phone: string | null }> =
-        [];
-      for (let from = 0; from < 100000; from += pageSize) {
-        const { data, error } = await supabase
-          .from("customers")
-          .select("phone_digits, phone")
-          .order("id")
-          .range(from, from + pageSize - 1);
-        if (error) throw error;
-        const batch = (data || []) as typeof rows;
-        rows.push(...batch);
-        if (batch.length < pageSize) break;
-      }
-      return rows;
-    })(),
-  ]);
+  return (await fetchCustomerPhoneSets(supabase)).protected;
+}
 
-  const phones = new Set<string>();
-  for (const c of customers) {
-    const d = normalizePhoneDigits(c.phone_digits || c.phone || "");
-    if (d) phones.add(d);
-  }
-  for (const line of saleLines) {
-    const d = normalizePhoneDigits(line.phone_digits || "");
-    if (d) phones.add(d);
-  }
-  return phones;
+/** Qualquer pedido: linha de venda, `orders`, itens ou garagem do cliente. */
+export async function fetchPurchasePhones(
+  supabase: SupabaseClient,
+): Promise<Set<string>> {
+  return (await fetchCustomerPhoneSets(supabase)).purchased;
 }
 
 /** @deprecated use fetchProtectedCustomerPhones */

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { assertBotApiKey, BotAuthError } from "@/lib/bot-auth";
 import {
-  fetchProtectedCustomerPhones,
+  fetchCustomerPhoneSets,
   splitInactivePhones,
 } from "@/lib/customer-activity";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -11,8 +11,9 @@ export const runtime = "nodejs";
 /**
  * Cruza telefones com cadastro/compra no estoque.
  * Body: { phones: string[] }
- * → { inactive, active }
+ * → { inactive, active, purchased }
  * active = cadastrado em customers OU telefone em sale line
+ * purchased = qualquer pedido (leilão / encomenda / evento / pedido / item / garagem)
  */
 export async function POST(req: Request) {
   try {
@@ -27,12 +28,15 @@ export async function POST(req: Request) {
     }
 
     const admin = createAdminClient();
-    const protectedPhones = await fetchProtectedCustomerPhones(admin);
+    const { protected: protectedPhones, purchased: purchasePhones } =
+      await fetchCustomerPhoneSets(admin);
     const { inactive, active } = splitInactivePhones(phones, protectedPhones);
+    const { active: purchased } = splitInactivePhones(phones, purchasePhones);
 
     return NextResponse.json({
       inactive,
       active,
+      purchased,
       checked: inactive.length + active.length,
     });
   } catch (e) {
