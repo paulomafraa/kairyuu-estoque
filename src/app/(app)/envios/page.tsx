@@ -7,6 +7,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
 import { createClient } from "@/lib/supabase/client";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
+import { fetchAllQueryRows } from "@/lib/customers";
 import {
   daysSincePayment,
   formatLeilaoGarageDeadline,
@@ -104,17 +105,23 @@ export default function EnviosPage() {
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const { data, error: err } = await supabase
-      .from("customer_garage_items")
-      .select(
-        "*, customers(id, name, phone), events(id, name, opened_at, kind, status)",
-      )
-      .gt("qty_with_store", 0)
-      .neq("status", "cancelled")
-      .order("updated_at", { ascending: false });
-
-    if (err) setError(err.message);
-    else setRows((data as OwedRow[]) || []);
+    try {
+      const data = await fetchAllQueryRows<OwedRow>((from, to) =>
+        supabase
+          .from("customer_garage_items")
+          .select(
+            "*, customers(id, name, phone), events(id, name, opened_at, kind, status)",
+          )
+          .gt("qty_with_store", 0)
+          .neq("status", "cancelled")
+          .order("updated_at", { ascending: false })
+          .order("id", { ascending: true })
+          .range(from, to),
+      );
+      setRows(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
     setLoading(false);
   }, [supabase]);
 

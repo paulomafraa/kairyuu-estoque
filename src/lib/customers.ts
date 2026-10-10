@@ -151,7 +151,9 @@ const QUERY_PAGE = 1000;
 
 /**
  * Pagina qualquer select do Supabase (teto padrão de 1000 linhas).
- * `run` deve aplicar `.range(from, to)` no builder.
+ * `run` deve aplicar `.range(from, to)` no builder e terminar a ordenação
+ * numa coluna única (ex. `.order("id")`). Ordenar só por `created_at` repete
+ * valores (import em lote grava o mesmo instante) e linhas somem entre páginas.
  */
 export async function fetchAllQueryRows<T>(
   run: (
@@ -276,7 +278,8 @@ export async function fetchSaleLinesForCustomer<T extends { id: string }>(
         .from("event_sale_lines")
         .select(select)
         .or(filters.join(","))
-        .order("created_at", { ascending: false }),
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: true }),
     ).range(from, to),
   );
 }

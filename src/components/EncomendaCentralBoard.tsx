@@ -130,6 +130,7 @@ export function EncomendaCentralBoard() {
               .select("*, customers(id, name, phone)")
               .in("event_id", chunk)
               .order("created_at", { ascending: true })
+              .order("id", { ascending: true })
               .range(from, to),
           );
           rows.push(...part);

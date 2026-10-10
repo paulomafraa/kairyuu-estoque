@@ -360,14 +360,30 @@ export default function EventoDetailPage() {
         .single(),
       (async () => {
         try {
-          const rows = await fetchAllQueryRows<EventSaleLine>((from, to) =>
+          const [rows, total] = await Promise.all([
+            fetchAllQueryRows<EventSaleLine>((from, to) =>
+              supabase
+                .from("event_sale_lines")
+                .select("*, customers(id, name, phone)")
+                .eq("event_id", eventId)
+                .order("created_at", { ascending: true })
+                .order("id", { ascending: true })
+                .range(from, to),
+            ),
             supabase
               .from("event_sale_lines")
-              .select("*, customers(id, name, phone)")
-              .eq("event_id", eventId)
-              .order("created_at", { ascending: true })
-              .range(from, to),
-          );
+              .select("id", { count: "exact", head: true })
+              .eq("event_id", eventId),
+          ]);
+          const expected = total.count ?? rows.length;
+          if (rows.length < expected) {
+            return {
+              data: rows,
+              error: {
+                message: `Faltaram ${expected - rows.length} de ${expected} linha(s) ao carregar o evento. Recarregue a página antes de mexer.`,
+              },
+            };
+          }
           return { data: rows, error: null as { message: string } | null };
         } catch (e) {
           return {
@@ -408,7 +424,7 @@ export default function EventoDetailPage() {
     }
 
     if (ln.error) setError(ln.error.message);
-    else {
+    if (ln.data) {
       const saleLines = (ln.data as EventSaleLine[]) || [];
       setLines(saleLines);
       const garageIds = [

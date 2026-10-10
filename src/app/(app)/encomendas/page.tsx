@@ -8,7 +8,7 @@ import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
 import { EncomendaCentralBoard } from "@/components/EncomendaCentralBoard";
 import { createClient } from "@/lib/supabase/client";
-import { fetchAllCustomers } from "@/lib/customers";
+import { fetchAllCustomers, fetchAllQueryRows } from "@/lib/customers";
 import { ORDER_STATUS_FLOW, ORDER_STATUS_LABEL, cardLabel } from "@/lib/labels";
 import type { Card, Customer, Order, OrderStatus, Profile } from "@/lib/types";
 
@@ -72,10 +72,17 @@ export default function EncomendasPage() {
     }
 
     const [or, cu, cd, profiles] = await Promise.all([
-      supabase
-        .from("orders")
-        .select("*, customers(*), cards(*)")
-        .order("created_at", { ascending: false }),
+      fetchAllQueryRows<Order>((from, to) =>
+        supabase
+          .from("orders")
+          .select("*, customers(*), cards(*)")
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: true })
+          .range(from, to),
+      ).then(
+        (rows) => ({ data: rows, error: null as Error | null }),
+        (e: Error) => ({ data: [] as Order[], error: e }),
+      ),
       fetchAllCustomers(supabase).then(
         (rows) => ({ data: rows, error: null as Error | null }),
         (e: Error) => ({ data: [] as Customer[], error: e }),

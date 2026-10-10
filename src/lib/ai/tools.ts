@@ -297,6 +297,7 @@ async function reportPendingPayments(
       .eq("cancelled", false)
       .eq("paid", false)
       .order("created_at", { ascending: false })
+      .order("id", { ascending: true })
       .range(from, from + pageSize - 1);
     const { data, error } = await q;
     if (error) return fail(error.message);

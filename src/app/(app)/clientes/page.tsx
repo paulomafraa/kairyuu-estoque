@@ -16,6 +16,7 @@ import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { parseClientsCsv, normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  buildPhoneCustomerIndex,
   buildPhoneLookup,
   customerPhoneDigits,
   ensureCustomerByPhone,
@@ -155,16 +156,31 @@ export default function ClientesPage() {
       setError(e instanceof Error ? e.message : String(e));
       return;
     }
+    const pageAll = <T,>(table: string, columns: string) =>
+      fetchAllQueryRows<T>(
+        (from, to) =>
+          supabase
+            .from(table)
+            .select(columns)
+            .order("id", { ascending: true })
+            .range(from, to) as unknown as PromiseLike<{
+            data: T[] | null;
+            error: { message: string } | null;
+          }>,
+      ).catch((e) => {
+        console.error(e);
+        return [] as T[];
+      });
     const [
-      { data: items },
-      { data: orders },
+      items,
+      orders,
       unpaidLines,
-      { data: events },
-      { data: garage },
+      events,
+      garage,
       { data: groupActivity, error: groupErr },
     ] = await Promise.all([
-      supabase.from("customer_items").select("customer_id"),
-      supabase.from("orders").select("customer_id"),
+      pageAll<{ customer_id: string }>("customer_items", "id, customer_id"),
+      pageAll<{ customer_id: string }>("orders", "id, customer_id"),
       fetchAllQueryRows<{
         customer_id: string | null;
         paid: boolean;
@@ -192,12 +208,24 @@ export default function ClientesPage() {
         console.error(e);
         return [];
       }),
-      supabase.from("events").select("id, payment_due_at, name, kind"),
-      supabase
-        .from("customer_garage_items")
-        .select(
-          "customer_id, status, qty_with_store, qty_sent, origin, created_at, title",
-        ),
+      pageAll<{
+        id: string;
+        payment_due_at: string | null;
+        name: string;
+        kind: string | null;
+      }>("events", "id, payment_due_at, name, kind"),
+      pageAll<{
+        customer_id: string;
+        status: string;
+        qty_with_store: number;
+        qty_sent: number;
+        origin: string | null;
+        created_at: string;
+        title: string;
+      }>(
+        "customer_garage_items",
+        "id, customer_id, status, qty_with_store, qty_sent, origin, created_at, title",
+      ),
       supabase
         .from("whatsapp_group_activity")
         .select("phone_digits, name, message_count, present, synced_at")
@@ -252,11 +280,22 @@ export default function ClientesPage() {
       kindByEvent.set(ev.id as string, (ev.kind as string) || "leilao");
     }
 
+    const customerByPhone = buildPhoneCustomerIndex(cu);
+    const lineOwnerId = (row: {
+      customer_id: string | null;
+      phone_digits: string | null;
+    }): string | null => {
+      if (row.customer_id) return row.customer_id;
+      const d = normalizePhoneDigits(row.phone_digits || "");
+      return d ? customerByPhone.get(d)?.id ?? null : null;
+    };
+
     const activeIds = new Set<string>();
     for (const row of items || []) activeIds.add(row.customer_id);
     for (const row of orders || []) activeIds.add(row.customer_id);
     for (const row of unpaidLines || []) {
-      if (row.customer_id) activeIds.add(row.customer_id);
+      const owner = lineOwnerId(row);
+      if (owner) activeIds.add(owner);
     }
     for (const row of garage || []) activeIds.add(row.customer_id as string);
 
@@ -269,15 +308,16 @@ export default function ClientesPage() {
     };
 
     for (const line of unpaidLines || []) {
-      if (!line.customer_id || line.paid) continue;
+      const owner = lineOwnerId(line);
+      if (!owner || line.paid) continue;
       const kind = kindByEvent.get(line.event_id as string);
       if (!isActiveBillableSaleLine(line, kind)) continue;
       const due = dueByEvent.get(line.event_id as string);
       const u = paymentUrgency(false, false, due);
-      if (u === "overdue") bump(line.customer_id as string, "pagamento atrasado");
-      else if (u === "warn") bump(line.customer_id as string, "prazo perto");
-      else if (!line.charged) bump(line.customer_id as string, "cobrança pendente");
-      else bump(line.customer_id as string, "em aberto no evento");
+      if (u === "overdue") bump(owner, "pagamento atrasado");
+      else if (u === "warn") bump(owner, "prazo perto");
+      else if (!line.charged) bump(owner, "cobrança pendente");
+      else bump(owner, "em aberto no evento");
     }
 
     const garageByCustomer = new Map<string, number>();

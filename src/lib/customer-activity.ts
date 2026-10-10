@@ -19,6 +19,7 @@ async function fetchAllIds(
     const { data, error } = await supabase
       .from(table)
       .select(column)
+      .order(column)
       .range(from, from + pageSize - 1);
     if (error) throw error;
     const batch = (data || []) as unknown as Array<Record<string, unknown>>;
@@ -39,7 +40,8 @@ async function fetchSaleLinePhones(
   for (let from = 0; from < 200000; from += pageSize) {
     const { data, error } = await supabase
       .from("event_sale_lines")
-      .select("phone_digits")
+      .select("id, phone_digits")
+      .order("id")
       .range(from, from + pageSize - 1);
     if (error) throw error;
     const batch = (data || []) as Array<{ phone_digits: string | null }>;
