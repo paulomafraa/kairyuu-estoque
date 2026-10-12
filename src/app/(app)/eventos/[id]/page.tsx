@@ -2723,7 +2723,37 @@ export default function EventoDetailPage() {
         );
         return;
       }
-      await supabase.from("event_product_costs").delete().eq("event_id", eventId);
+      const byTitle = new Map<string, EncomendaCostRow>();
+      const repeated = new Set<string>();
+      const conflicting = new Set<string>();
+      for (const r of rows) {
+        const title = r.product_title.trim();
+        const prev = byTitle.get(title);
+        if (!prev) {
+          byTitle.set(title, { ...r, product_title: title });
+          continue;
+        }
+        repeated.add(title);
+        for (const k of ["cost_jp", "price_sale", "price_liga"] as const) {
+          if (prev[k] == null) prev[k] = r[k];
+          else if (r[k] != null && r[k] !== prev[k]) conflicting.add(title);
+        }
+        if (!prev.link && r.link) prev.link = r.link;
+      }
+      rows = [...byTitle.values()];
+      const previous = await supabase
+        .from("event_product_costs")
+        .select("*")
+        .eq("event_id", eventId);
+      const previousRows = (previous.data || []) as Record<string, unknown>[];
+      const { error: delErr } = await supabase
+        .from("event_product_costs")
+        .delete()
+        .eq("event_id", eventId);
+      if (delErr) {
+        setError(delErr.message);
+        return;
+      }
       const payload = rows.map((r) => ({
         event_id: eventId,
         product_title: r.product_title,
@@ -2744,8 +2774,11 @@ export default function EventoDetailPage() {
         err = retry.error;
       }
       if (err) {
+        if (previousRows.length) {
+          await supabase.from("event_product_costs").insert(previousRows);
+        }
         setError(
-          err.message.includes("event_product_costs")
+          /does not exist|schema cache/i.test(err.message)
             ? `${err.message} — rode supabase/migration_event_product_costs.sql`
             : err.message,
         );
@@ -2765,10 +2798,17 @@ export default function EventoDetailPage() {
         .from("events")
         .update({ notes: embedCardOrder(event?.notes, order) })
         .eq("id", eventId);
+      const repeatedNote = repeated.size
+        ? ` ${repeated.size} carta(s) repetida(s) na planilha foram juntadas numa linha só${
+            conflicting.size
+              ? ` — ATENÇÃO, com valores diferentes (usei o da primeira linha): ${[...conflicting].slice(0, 5).join("; ")}${conflicting.size > 5 ? ` +${conflicting.size - 5}` : ""}`
+              : ""
+          }.`
+        : "";
       setInfo(
-        missingSortCol
+        (missingSortCol
           ? `Custos importados: ${rows.length} carta(s)${sheetNote}. Rode supabase/migration_event_money_sort.sql para guardar a ordem da aba.`
-          : `Custos importados: ${rows.length} carta(s)${sheetNote}.`,
+          : `Custos importados: ${rows.length} carta(s)${sheetNote}.`) + repeatedNote,
       );
       await load();
     } finally {
