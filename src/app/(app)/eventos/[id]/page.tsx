@@ -29,6 +29,8 @@ import {
   ensureCustomerByPhone,
   fetchAllCustomers,
   fetchAllQueryRows,
+  fetchCustomersSharingPhone,
+  fetchSaleLinesForCustomer,
   looksLikePhoneName,
   matchesCustomerQuery,
 } from "@/lib/customers";
@@ -244,6 +246,17 @@ export default function EventoDetailPage() {
   const [productStock, setProductStock] = useState<EventProductStock[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [physicalBoxes, setPhysicalBoxes] = useState<PhysicalBox[]>([]);
+  const [boxPick, setBoxPick] = useState("");
+  const [boxPickerOpen, setBoxPickerOpen] = useState(false);
+  const [lastBoxing, setLastBoxing] = useState<{
+    customerId: string;
+    customerName: string;
+    boxLabel: string;
+    prevBoxId: string | null;
+    createdBoxId: string | null;
+    boxedIds: string[];
+    separatedIds: string[];
+  } | null>(null);
   const [allocations, setAllocations] = useState<EventAllocation[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
   const [meId, setMeId] = useState<string | null>(null);
@@ -472,7 +485,10 @@ export default function EventoDetailPage() {
       setProductCosts((costs.data as EventProductCost[]) || []);
     }
     setCustomers(await customersPromise);
-    const bx = await supabase.from("physical_boxes").select("*");
+    const bx = await supabase
+      .from("physical_boxes")
+      .select("*")
+      .order("label", { ascending: true });
     setPhysicalBoxes(bx.error ? [] : ((bx.data || []) as PhysicalBox[]));
   }, [supabase, eventId]);
 
@@ -1418,6 +1434,250 @@ export default function EventoDetailPage() {
       },
       value ? "Na caixa geral" : "Retirado da caixa geral",
     );
+  }
+
+  async function fetchAllLinesOfCustomer(customer: Customer) {
+    const phone = customerPhoneDigits(customer);
+    const related = await fetchCustomersSharingPhone(
+      supabase,
+      customer.id,
+      phone,
+    ).catch(() => [] as Customer[]);
+    const relatedIds = [...new Set([customer.id, ...related.map((c) => c.id)])];
+    return fetchSaleLinesForCustomer<
+      EventSaleLine & { events?: { kind: Event["kind"] } | null }
+    >(supabase, {
+      customerIds: relatedIds,
+      phoneDigits: phone,
+      select: "*, events(kind)",
+      cancelled: false,
+    });
+  }
+
+  async function updateLinesInChunks(ids: string[], patch: Record<string, unknown>) {
+    for (let i = 0; i < ids.length; i += 200) {
+      const { error: err } = await supabase
+        .from("event_sale_lines")
+        .update(patch)
+        .in("id", ids.slice(i, i + 200));
+      if (err) throw new Error(err.message);
+    }
+  }
+
+  async function logBoxAction(
+    customerId: string,
+    action: string,
+    detail: string,
+  ) {
+    await supabase.from("customer_garage_events").insert({
+      customer_id: customerId,
+      action,
+      detail,
+      created_by: meId,
+    });
+    await logStaffAction(supabase, {
+      action,
+      detail,
+      created_by: meId,
+      entity_type: "physical_box",
+      customer_id: customerId,
+      event_id: eventId,
+    });
+  }
+
+  async function undoLastBoxing() {
+    const undo = lastBoxing;
+    if (!undo) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await updateLinesInChunks(undo.boxedIds, {
+        boxed: false,
+        boxed_at: null,
+        boxed_by: null,
+      });
+      await updateLinesInChunks(undo.separatedIds, {
+        separated: false,
+        separated_at: null,
+        separated_by: null,
+      });
+      const { error: linkErr } = await supabase
+        .from("customers")
+        .update({ physical_box_id: undo.prevBoxId })
+        .eq("id", undo.customerId);
+      if (linkErr) throw new Error(linkErr.message);
+      if (undo.createdBoxId) {
+        const { error: delErr } = await supabase
+          .from("physical_boxes")
+          .delete()
+          .eq("id", undo.createdBoxId);
+        if (delErr) throw new Error(delErr.message);
+      }
+      await logBoxAction(
+        undo.customerId,
+        "physical_box_undo",
+        `Desfeito: ${undo.customerName} na caixinha ${undo.boxLabel} · ${undo.boxedIds.length} item(ns) tirados da caixa · ${meName}`,
+      );
+      setInfo(
+        `Desfeito · ${undo.customerName} voltou como estava antes (${undo.boxedIds.length} item(ns) tirados da caixa).`,
+      );
+      setLastBoxing(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unlinkCustomerBox(customer: Customer, boxLabel: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      const allLines = await fetchAllLinesOfCustomer(customer);
+      const boxedIds = allLines.filter((l) => l.boxed).map((l) => l.id);
+      await updateLinesInChunks(boxedIds, {
+        boxed: false,
+        boxed_at: null,
+        boxed_by: null,
+      });
+      const { error: linkErr } = await supabase
+        .from("customers")
+        .update({ physical_box_id: null })
+        .eq("id", customer.id);
+      if (linkErr) throw new Error(linkErr.message);
+      await logBoxAction(
+        customer.id,
+        "physical_box_unlink",
+        `Desassociado da caixinha ${boxLabel} · ${boxedIds.length} item(ns) tirados da caixa · ${meName}`,
+      );
+      setInfo(
+        `${customer.name} desassociado da caixinha "${boxLabel}" · ${boxedIds.length} item(ns) tirados da caixa (continuam separados).`,
+      );
+      setLastBoxing(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Vincula o cliente à caixinha e coloca nela tudo dele, de todas as rodadas. */
+  async function boxEverythingForCustomer(customer: Customer, label: string) {
+    const wanted = label.trim();
+    if (!wanted) return;
+    setBusy(true);
+    setError(null);
+    try {
+      let box = physicalBoxes.find(
+        (b) => b.label.toLowerCase() === wanted.toLowerCase(),
+      );
+      let createdBoxId: string | null = null;
+      if (!box) {
+        const created = await supabase
+          .from("physical_boxes")
+          .insert({ label: wanted, created_by: meId })
+          .select("*")
+          .single();
+        if (created.error) throw new Error(created.error.message);
+        box = created.data as PhysicalBox;
+        createdBoxId = box.id;
+      }
+      const prevBoxId = customer.physical_box_id || null;
+      if (prevBoxId !== box.id) {
+        const { error: linkErr } = await supabase
+          .from("customers")
+          .update({ physical_box_id: box.id })
+          .eq("id", customer.id);
+        if (linkErr) throw new Error(linkErr.message);
+      }
+
+      const allLines = await fetchAllLinesOfCustomer(customer);
+
+      const garageIds = [
+        ...new Set(
+          allLines.map((l) => l.garage_item_id).filter(Boolean) as string[],
+        ),
+      ];
+      const garage: Record<string, GarageItem> = {};
+      for (let i = 0; i < garageIds.length; i += 200) {
+        const { data, error: gErr } = await supabase
+          .from("customer_garage_items")
+          .select("*")
+          .in("id", garageIds.slice(i, i + 200));
+        if (gErr) throw new Error(gErr.message);
+        for (const g of (data || []) as GarageItem[]) garage[g.id] = g;
+      }
+
+      const targets = allLines.filter(
+        (l) =>
+          !l.boxed &&
+          !isShelvedSaleLine(l, l.events?.kind) &&
+          !lineAlreadyShippedWithGarage(l, garage),
+      );
+      const now = new Date().toISOString();
+      const notSeparated = targets.filter((l) => !l.separated).map((l) => l.id);
+      for (let i = 0; i < notSeparated.length; i += 200) {
+        const { error: sepErr } = await supabase
+          .from("event_sale_lines")
+          .update({ separated: true, separated_at: now, separated_by: meId })
+          .in("id", notSeparated.slice(i, i + 200));
+        if (sepErr) throw new Error(sepErr.message);
+      }
+      const targetIds = targets.map((l) => l.id);
+      for (let i = 0; i < targetIds.length; i += 200) {
+        const { error: boxErr } = await supabase
+          .from("event_sale_lines")
+          .update({ boxed: true, boxed_at: now, boxed_by: meId })
+          .in("id", targetIds.slice(i, i + 200));
+        if (boxErr) throw new Error(boxErr.message);
+      }
+
+      const eventCount = new Set(targets.map((l) => l.event_id)).size;
+      const detail = `Caixinha física ${box.label} · ${targetIds.length} item(ns) colocados de ${eventCount} rodada(s) · ${meName}`;
+      await supabase.from("customer_garage_events").insert({
+        customer_id: customer.id,
+        action: "physical_box_link",
+        detail,
+        created_by: meId,
+      });
+      await logStaffAction(supabase, {
+        action: "physical_box_link",
+        detail: `${customer.name} → ${detail}`,
+        created_by: meId,
+        entity_type: "physical_box",
+        entity_id: box.id,
+        customer_id: customer.id,
+        event_id: eventId,
+      });
+      setInfo(
+        `${customer.name} na caixinha "${box.label}" · ${targetIds.length} item(ns) colocados (${eventCount} rodada(s)).`,
+      );
+      setLastBoxing({
+        customerId: customer.id,
+        customerName: customer.name,
+        boxLabel: box.label,
+        prevBoxId,
+        createdBoxId,
+        boxedIds: targetIds,
+        separatedIds: notSeparated,
+      });
+      setBoxPick("");
+      setBoxPickerOpen(false);
+      await load();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      setError(
+        /duplicate key|unique/i.test(message)
+          ? "Já existe uma caixinha com esse nome."
+          : /physical_box/i.test(message)
+            ? `${message} — rode supabase/migration_physical_boxes.sql no Supabase.`
+            : message,
+      );
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function markCharged(ids: string[], value: boolean) {
@@ -4712,19 +4972,134 @@ export default function EventoDetailPage() {
                       activeParticipant.phone,
                     )}
                   </h2>
-                  {activeParticipant.customer_id ? (
-                    activeHasPhysicalBox ? (
-                      <Badge
-                        tone="info"
-                        title="Cliente tem caixinha física unificada (saco grande)"
-                      >
-                        Caixinha física · {activePhysicalBox?.label}
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-zinc-500">
-                        Sem caixinha física registrada
+                  {activeCustomer ? (
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                      {activeHasPhysicalBox ? (
+                        <Badge
+                          tone="info"
+                          title="Cliente tem caixinha física unificada (saco grande)"
+                        >
+                          Caixinha física · {activePhysicalBox?.label}
+                        </Badge>
+                      ) : (
+                        <span className="text-zinc-500">
+                          Sem caixinha física registrada
+                        </span>
+                      )}
+                      {boxPickerOpen ? (
+                        <>
+                          <input
+                            className="field w-56 py-1 text-xs"
+                            list="event-physical-box-options"
+                            placeholder="Buscar caixinha…"
+                            autoFocus
+                            value={boxPick}
+                            onChange={(e) => setBoxPick(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && boxPick.trim()) {
+                                void boxEverythingForCustomer(activeCustomer, boxPick);
+                              }
+                              if (e.key === "Escape") setBoxPickerOpen(false);
+                            }}
+                          />
+                          <datalist id="event-physical-box-options">
+                            {physicalBoxes.map((b) => (
+                              <option key={b.id} value={b.label} />
+                            ))}
+                          </datalist>
+                          <button
+                            type="button"
+                            className="btn-primary px-2 py-1 text-xs"
+                            disabled={busy || !boxPick.trim()}
+                            title="Vincula o cliente e coloca na caixa tudo dele, desta e de todas as outras rodadas"
+                            onClick={() =>
+                              void boxEverythingForCustomer(activeCustomer, boxPick)
+                            }
+                          >
+                            {boxPick.trim() &&
+                            !physicalBoxes.some(
+                              (b) =>
+                                b.label.toLowerCase() === boxPick.trim().toLowerCase(),
+                            )
+                              ? "Criar caixinha e colocar tudo"
+                              : "Colocar tudo nesta caixinha"}
+                          </button>
+                          <button
+                            type="button"
+                            className="text-zinc-600 underline"
+                            onClick={() => {
+                              setBoxPickerOpen(false);
+                              setBoxPick("");
+                            }}
+                          >
+                            cancelar
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="font-medium text-violet-800 underline"
+                            onClick={() => {
+                              setBoxPick("");
+                              setBoxPickerOpen(true);
+                            }}
+                          >
+                            {activeHasPhysicalBox ? "Trocar caixinha" : "Associar caixinha"}
+                          </button>
+                          {activePhysicalBox ? (
+                            <button
+                              type="button"
+                              className="font-medium text-violet-800 underline"
+                              disabled={busy}
+                              title="Coloca na caixa tudo que ainda está fora, desta e de todas as outras rodadas"
+                              onClick={() =>
+                                void boxEverythingForCustomer(
+                                  activeCustomer,
+                                  activePhysicalBox.label,
+                                )
+                              }
+                            >
+                              Colocar tudo na caixa (todas as rodadas)
+                            </button>
+                          ) : null}
+                          {activePhysicalBox ? (
+                            <ConfirmButton
+                              label="Desassociar"
+                              confirmLabel="Desassociar e tirar tudo da caixa?"
+                              className="font-medium text-red-700 underline"
+                              disabled={busy}
+                              onConfirm={() =>
+                                unlinkCustomerBox(activeCustomer, activePhysicalBox.label)
+                              }
+                            />
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  ) : null}
+                  {lastBoxing ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-xs text-violet-900">
+                      <span>
+                        {lastBoxing.customerName} → caixinha &quot;{lastBoxing.boxLabel}&quot; ·{" "}
+                        {lastBoxing.boxedIds.length} item(ns) colocados
                       </span>
-                    )
+                      <button
+                        type="button"
+                        className="font-semibold underline"
+                        disabled={busy}
+                        onClick={() => void undoLastBoxing()}
+                      >
+                        Desfazer
+                      </button>
+                      <button
+                        type="button"
+                        className="text-violet-700 underline"
+                        onClick={() => setLastBoxing(null)}
+                      >
+                        ok
+                      </button>
+                    </div>
                   ) : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
