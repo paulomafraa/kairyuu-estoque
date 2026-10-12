@@ -43,7 +43,8 @@ type Filter =
   | "pendencias"
   | "todos"
   | "prazo_leilao"
-  | "inativos_grupo";
+  | "inativos_grupo"
+  | "caixa_fisica";
 
 type SilentGroupMember = {
   phone_digits: string;
@@ -621,6 +622,7 @@ export default function ClientesPage() {
         return false;
       }
       if (filter === "inativos_grupo" && !c.silentInactive) return false;
+      if (filter === "caixa_fisica" && !c.physical_box) return false;
       return matchesSearch(c.searchHay, c.searchDigits);
     });
     if (filter !== "inativos_grupo") return rows;
@@ -645,7 +647,9 @@ export default function ClientesPage() {
     let pendencias = 0;
     let prazoLeilao = 0;
     let inativosGrupo = 0;
+    let caixaFisica = 0;
     for (const c of customers) {
+      if (c.physical_box) caixaFisica += 1;
       if (c.hasOrders) ativos += 1;
       else semPedidos += 1;
       if (c.pendencias > 0) pendencias += 1;
@@ -664,6 +668,7 @@ export default function ClientesPage() {
       pendencias,
       prazo_leilao: prazoLeilao,
       inativos_grupo: inativosGrupo + silentUnregistered.length,
+      caixa_fisica: caixaFisica,
     };
   }, [customers, silentUnregistered]);
 
@@ -821,6 +826,7 @@ export default function ClientesPage() {
               "inativos_grupo",
               `Inativos do grupo (${counts.inativos_grupo})`,
             ],
+            ["caixa_fisica", `Com caixinha física (${counts.caixa_fisica})`],
             ["ativos", `Ativos (${counts.ativos})`],
             ["sem_pedidos", `Sem pedidos (${counts.sem_pedidos})`],
             ["todos", `Todos (${counts.todos})`],
@@ -923,6 +929,12 @@ export default function ClientesPage() {
                       {c.caixinhaCount > 0 ? (
                         <Badge tone="info">
                           Caixinha/garagem ({c.caixinhaCount})
+                        </Badge>
+                      ) : null}
+                      {c.physical_box ? (
+                        <Badge tone="info">
+                          Caixinha física
+                          {c.physical_box_label ? ` · ${c.physical_box_label}` : ""}
                         </Badge>
                       ) : null}
                       {c.hasOrders ? (

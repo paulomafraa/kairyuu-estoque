@@ -146,6 +146,9 @@ export default function ClienteDetailPage() {
 
   const [editName, setEditName] = useState("");
   const [editingName, setEditingName] = useState(false);
+  const [boxLabel, setBoxLabel] = useState("");
+  const [editingBox, setEditingBox] = useState(false);
+  const [openBoxedEvents, setOpenBoxedEvents] = useState<Record<string, boolean>>({});
 
   const [title, setTitle] = useState("");
   const [category, setCategory] = useState<GarageCategory>("carta");
@@ -195,6 +198,7 @@ export default function ClienteDetailPage() {
     const current = cu.data as Customer;
     setCustomer(current);
     setEditName(current.name);
+    setBoxLabel(current.physical_box_label || "");
 
     const phoneDigits =
       current.phone_digits || normalizePhoneDigits(current.phone || "");
@@ -331,6 +335,119 @@ export default function ClienteDetailPage() {
       entity_id: itemId || "",
       customer_id: customerId,
     });
+  }
+
+  function physicalBoxError(message: string) {
+    return /physical_box|boxed/i.test(message)
+      ? `${message} — rode supabase/migration_physical_box.sql no Supabase.`
+      : message;
+  }
+
+  async function savePhysicalBox(registered: boolean) {
+    const label = boxLabel.trim();
+    setBusy(true);
+    setError(null);
+    const patch = registered
+      ? {
+          physical_box: true,
+          physical_box_label: label,
+          ...(customer?.physical_box
+            ? {}
+            : {
+                physical_box_since: new Date().toISOString(),
+                physical_box_by: meId,
+              }),
+        }
+      : {
+          physical_box: false,
+          physical_box_label: "",
+          physical_box_since: null,
+          physical_box_by: null,
+        };
+    const { error: err } = await supabase
+      .from("customers")
+      .update(patch)
+      .eq("id", customerId);
+    setBusy(false);
+    if (err) {
+      setError(physicalBoxError(err.message));
+      return;
+    }
+    const action = !registered
+      ? "physical_box_remove"
+      : customer?.physical_box
+        ? "physical_box_edit"
+        : "physical_box_register";
+    const detail = !registered
+      ? `Caixinha física removida · ${meName}`
+      : customer?.physical_box
+        ? `Caixinha física atualizada${label ? ` · ${label}` : ""} · ${meName}`
+        : `Caixinha física registrada${label ? ` · ${label}` : ""} · ${meName}`;
+    await logEvent(action, detail);
+    setInfo(
+      !registered
+        ? "Registro da caixinha física removido."
+        : customer?.physical_box
+          ? "Caixinha física atualizada."
+          : "Caixinha física registrada.",
+    );
+    setEditingBox(false);
+    await load();
+  }
+
+  async function setLinesBoxed(lines: ChargeLine[], value: boolean, label: string) {
+    const ids = lines.filter((l) => Boolean(l.boxed) !== value).map((l) => l.id);
+    if (!ids.length) {
+      setInfo(value ? "Nada para colocar — já está na caixa." : "Nada para retirar.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const now = new Date().toISOString();
+    if (value) {
+      const notSeparated = lines
+        .filter((l) => ids.includes(l.id) && !l.separated)
+        .map((l) => l.id);
+      if (notSeparated.length) {
+        const { error: sepErr } = await supabase
+          .from("event_sale_lines")
+          .update({ separated: true, separated_at: now, separated_by: meId })
+          .in("id", notSeparated);
+        if (sepErr) {
+          setBusy(false);
+          setError(sepErr.message);
+          return;
+        }
+      }
+    }
+    const { error: err } = await supabase
+      .from("event_sale_lines")
+      .update({
+        boxed: value,
+        boxed_at: value ? now : null,
+        boxed_by: value ? meId : null,
+      })
+      .in("id", ids);
+    setBusy(false);
+    if (err) {
+      setError(physicalBoxError(err.message));
+      return;
+    }
+    const titles = lines
+      .filter((l) => ids.includes(l.id))
+      .slice(0, 8)
+      .map((l) => l.product_title)
+      .join("; ");
+    await logEvent(
+      value ? "boxed" : "unboxed",
+      `${value ? "Na caixa geral" : "Retirado da caixa geral"} · ${label} · ${ids.length} item(ns)${titles ? ` · ${titles}` : ""} · ${meName}`,
+    );
+    setInfo(
+      value
+        ? `Colocado na caixa geral · ${ids.length} item(ns) · ${label}`
+        : `Retirado da caixa geral · ${ids.length} item(ns) · ${label}`,
+    );
+    await load();
   }
 
   async function saveName() {
@@ -928,6 +1045,61 @@ export default function ClienteDetailPage() {
       (b.eventDate || "").localeCompare(a.eventDate || ""),
     );
   }, [chargeLines]);
+
+  const boxGroups = useMemo(() => {
+    const itemById = new Map(items.map((i) => [i.id, i]));
+    const byId = new Map<
+      string,
+      {
+        eventId: string;
+        eventName: string;
+        eventDate: string | null;
+        kind: string;
+        toBox: ChargeLine[];
+        inBox: ChargeLine[];
+      }
+    >();
+    for (const line of chargeLines) {
+      const kind = line.events?.kind || "outro";
+      if (isShelvedSaleLine(line, kind)) continue;
+      const g = line.garage_item_id ? itemById.get(line.garage_item_id) : null;
+      if (g && g.status !== "cancelled" && g.qty_with_store <= 0 && g.qty_sent > 0) {
+        continue;
+      }
+      const eventId = line.event_id || line.events?.id;
+      if (!eventId) continue;
+      let row = byId.get(eventId);
+      if (!row) {
+        row = {
+          eventId,
+          eventName: line.events?.name || "Evento",
+          eventDate: eventHappenedOn({
+            name: line.events?.name,
+            opened_at: line.events?.opened_at,
+          }),
+          kind,
+          toBox: [],
+          inBox: [],
+        };
+        byId.set(eventId, row);
+      }
+      if (line.boxed) row.inBox.push(line);
+      else row.toBox.push(line);
+    }
+    return [...byId.values()].sort((a, b) =>
+      (b.eventDate || "").localeCompare(a.eventDate || ""),
+    );
+  }, [chargeLines, items]);
+
+  const boxTotals = useMemo(() => {
+    let toBox = 0;
+    let inBox = 0;
+    for (const g of boxGroups) {
+      toBox += g.toBox.length;
+      inBox += g.inBox.length;
+    }
+    return { toBox, inBox };
+  }, [boxGroups]);
 
   const whatsappUrl = useMemo(() => {
     const digits = normalizePhoneDigits(customer?.phone || customer?.phone_digits || "");
@@ -1768,6 +1940,211 @@ export default function ClienteDetailPage() {
             )}
           </>
         )}
+      </section>
+
+      <section id="caixinha-fisica" className="panel mb-6 space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">Caixinha física unificada</h2>
+            <p className="mt-1 text-sm text-zinc-600">
+              O saco grande com tudo que o cliente tem guardado. Depois de
+              separar o envelope da rodada, marque aqui quando colocar as
+              cartas dentro dele — é o último passo.
+            </p>
+          </div>
+          {customer.physical_box ? (
+            <div className="flex flex-wrap gap-2">
+              <Badge tone="info">
+                Caixinha física
+                {customer.physical_box_label
+                  ? ` · ${customer.physical_box_label}`
+                  : ""}
+              </Badge>
+              <Badge tone={boxTotals.toBox > 0 ? "warn" : "good"}>
+                {boxTotals.toBox > 0
+                  ? `${boxTotals.toBox} para colocar`
+                  : "Tudo na caixa"}
+              </Badge>
+              <Badge tone="neutral">{boxTotals.inBox} na caixa</Badge>
+            </div>
+          ) : null}
+        </div>
+
+        {!customer.physical_box || editingBox ? (
+          <div className="flex flex-wrap items-end gap-2 rounded-md border border-zinc-200 bg-zinc-50 p-3">
+            <label className="min-w-[14rem] flex-1 text-sm">
+              <span className="mb-1 block text-zinc-600">
+                Identificação (opcional)
+              </span>
+              <input
+                className="field"
+                placeholder="Ex.: Saco 12 · prateleira B"
+                value={boxLabel}
+                onChange={(e) => setBoxLabel(e.target.value)}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={busy}
+              onClick={() => void savePhysicalBox(true)}
+            >
+              {customer.physical_box ? "Salvar" : "Registrar caixinha física"}
+            </button>
+            {editingBox ? (
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => {
+                  setEditingBox(false);
+                  setBoxLabel(customer.physical_box_label || "");
+                }}
+              >
+                Cancelar
+              </button>
+            ) : null}
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-600">
+            <span>
+              Desde {fmtDate(customer.physical_box_since)}
+            </span>
+            <button
+              type="button"
+              className="text-xs font-medium text-sky-800 underline"
+              onClick={() => setEditingBox(true)}
+            >
+              Editar identificação
+            </button>
+            <ConfirmButton
+              label="Remover registro"
+              confirmLabel="Remover a caixinha física?"
+              className="text-xs font-medium text-red-700 underline"
+              disabled={busy}
+              onConfirm={() => savePhysicalBox(false)}
+            />
+          </div>
+        )}
+
+        {customer.physical_box ? (
+          boxGroups.length === 0 ? (
+            <p className="text-sm text-zinc-500">
+              Nenhuma carta de evento guardada para este cliente.
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {boxGroups.map((g) => {
+                const kindLabel =
+                  g.kind === "leilao"
+                    ? "Leilão"
+                    : g.kind === "encomenda"
+                      ? "Encomenda"
+                      : g.kind;
+                const label = `${kindLabel} · ${fmtDay(g.eventDate)}`;
+                const showBoxed = Boolean(openBoxedEvents[g.eventId]);
+                return (
+                  <li
+                    key={g.eventId}
+                    className="rounded-md border border-zinc-200 bg-white px-3 py-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <Link
+                        href={`/eventos/${g.eventId}`}
+                        className="text-sm font-medium text-zinc-900 underline decoration-zinc-300 underline-offset-2"
+                      >
+                        {label}
+                      </Link>
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        {g.toBox.length > 0 ? (
+                          <Badge tone="warn">{g.toBox.length} para colocar</Badge>
+                        ) : (
+                          <Badge tone="good">rodada na caixa</Badge>
+                        )}
+                        {g.inBox.length > 0 ? (
+                          <button
+                            type="button"
+                            className="text-zinc-600 underline"
+                            onClick={() =>
+                              setOpenBoxedEvents((s) => ({
+                                ...s,
+                                [g.eventId]: !s[g.eventId],
+                              }))
+                            }
+                          >
+                            {showBoxed ? "ocultar" : "ver"} {g.inBox.length} na caixa
+                          </button>
+                        ) : null}
+                        {g.toBox.length > 0 ? (
+                          <button
+                            type="button"
+                            className="btn-primary px-2 py-1 text-xs"
+                            disabled={busy}
+                            onClick={() => void setLinesBoxed(g.toBox, true, label)}
+                          >
+                            Colocar rodada na caixa
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                    {g.toBox.length > 0 ? (
+                      <ul className="mt-2 space-y-1">
+                        {g.toBox.map((line) => (
+                          <li
+                            key={line.id}
+                            className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                          >
+                            <span className="text-zinc-800">
+                              {line.product_title}
+                              {Number(line.qty) > 1 ? ` ×${line.qty}` : ""}
+                              <span className="ml-2 text-zinc-400">
+                                {line.separated ? "separado" : "não separado"}
+                                {line.paid ? " · pago" : " · em aberto"}
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              className="font-medium text-violet-800 underline"
+                              disabled={busy}
+                              onClick={() => void setLinesBoxed([line], true, label)}
+                            >
+                              Colocar
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {showBoxed && g.inBox.length > 0 ? (
+                      <ul className="mt-2 space-y-1 border-t border-zinc-100 pt-2">
+                        {g.inBox.map((line) => (
+                          <li
+                            key={line.id}
+                            className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                          >
+                            <span className="text-zinc-600">
+                              {line.product_title}
+                              {Number(line.qty) > 1 ? ` ×${line.qty}` : ""}
+                              <span className="ml-2 text-zinc-400">
+                                na caixa desde {fmtDate(line.boxed_at)}
+                              </span>
+                            </span>
+                            <button
+                              type="button"
+                              className="text-zinc-500 underline"
+                              disabled={busy}
+                              onClick={() => void setLinesBoxed([line], false, label)}
+                            >
+                              Retirar
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        ) : null}
       </section>
 
       <form onSubmit={addItem} className="panel mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">

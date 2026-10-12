@@ -96,7 +96,7 @@ type Participant = {
 };
 
 /** Estágio do fluxo: vermelho → laranja → amarelo → azul → verde. */
-type ParticipantFlowStage = 0 | 1 | 2 | 3 | 4;
+type ParticipantFlowStage = 0 | 1 | 2 | 3 | 4 | 5;
 
 const PARTICIPANT_FLOW_LEGEND: Array<{
   stage: ParticipantFlowStage;
@@ -107,7 +107,8 @@ const PARTICIPANT_FLOW_LEGEND: Array<{
   { stage: 1, label: "Cobrado", swatch: "bg-orange-400" },
   { stage: 2, label: "Pago", swatch: "bg-amber-300" },
   { stage: 3, label: "Separado", swatch: "bg-sky-400" },
-  { stage: 4, label: "Enviado", swatch: "bg-emerald-400" },
+  { stage: 4, label: "Na caixa geral", swatch: "bg-violet-400" },
+  { stage: 5, label: "Enviado", swatch: "bg-emerald-400" },
 ];
 
 function lineAlreadyShippedWithGarage(
@@ -129,7 +130,8 @@ function saleLineFlowStage(
   line: EventSaleLine,
   garageById: Record<string, GarageItem>,
 ): ParticipantFlowStage {
-  if (lineAlreadyShippedWithGarage(line, garageById)) return 4;
+  if (lineAlreadyShippedWithGarage(line, garageById)) return 5;
+  if (line.boxed) return 4;
   if (line.separated) return 3;
   if (line.paid) return 2;
   if (line.charged) return 1;
@@ -146,7 +148,7 @@ function participantFlowStage(
     (l) => !l.cancelled && !isShelvedSaleLine(l, kind),
   );
   if (!active.length) return 0;
-  let min: ParticipantFlowStage = 4;
+  let min: ParticipantFlowStage = 5;
   for (const l of active) {
     const s = saleLineFlowStage(l, garageById);
     if (s < min) min = s;
@@ -164,7 +166,8 @@ function participantFlowCardClass(
       1: "bg-orange-700 text-white ring-2 ring-orange-950",
       2: "bg-amber-600 text-white ring-2 ring-amber-900",
       3: "bg-sky-700 text-white ring-2 ring-sky-950",
-      4: "bg-emerald-700 text-white ring-2 ring-emerald-950",
+      4: "bg-violet-700 text-white ring-2 ring-violet-950",
+      5: "bg-emerald-700 text-white ring-2 ring-emerald-950",
     };
     return selectedByStage[stage];
   }
@@ -173,7 +176,8 @@ function participantFlowCardClass(
     1: "bg-orange-50 text-orange-950 hover:bg-orange-100",
     2: "bg-amber-50 text-amber-950 hover:bg-amber-100",
     3: "bg-sky-50 text-sky-950 hover:bg-sky-100",
-    4: "bg-emerald-50 text-emerald-950 hover:bg-emerald-100",
+    4: "bg-violet-50 text-violet-950 hover:bg-violet-100",
+    5: "bg-emerald-50 text-emerald-950 hover:bg-emerald-100",
   };
   return idleByStage[stage];
 }
@@ -579,6 +583,11 @@ export default function EventoDetailPage() {
   const activeParticipant =
     participants.find((p) => p.key === selectedParticipant) ||
     shelvedOnlyParticipants.find((p) => p.key === selectedParticipant);
+
+  const activeCustomer = activeParticipant?.customer_id
+    ? customers.find((c) => c.id === activeParticipant.customer_id) || null
+    : null;
+  const activeHasPhysicalBox = Boolean(activeCustomer?.physical_box);
 
   const activeMainLines = useMemo(
     () =>
@@ -1340,9 +1349,21 @@ export default function EventoDetailPage() {
     }
     setInfo(`${label} · ${ids.length} item(ns) · ${meName}`);
     setSelectedLineIds({});
+    const touched = lines.filter((l) => ids.includes(l.id));
+    const described = touched
+      .slice(0, 8)
+      .map((l) => {
+        const who =
+          l.customers?.name || l.customer_name_snapshot || l.phone_digits || "sem cliente";
+        return `${l.product_title} (${who})`;
+      })
+      .join("; ");
+    const more = touched.length > 8 ? ` +${touched.length - 8}` : "";
     await logStaffAction(supabase, {
       action: label,
-      detail: `${label} · ${ids.length} item(ns) no evento ${event?.name || eventId}`,
+      detail: `${label} · ${ids.length} item(ns) no evento ${event?.name || eventId}${
+        described ? ` · ${described}${more}` : ""
+      }${typeof patch.cancel_reason === "string" && patch.cancel_reason ? ` · motivo: ${patch.cancel_reason}` : ""}`,
       created_by: meId,
       entity_type: "event_sale_lines",
       entity_id: ids.join(","),
@@ -1360,6 +1381,35 @@ export default function EventoDetailPage() {
         separated_by: value ? meId : null,
       },
       value ? "Separado" : "Separação desfeita",
+    );
+  }
+
+  async function markBoxed(ids: string[], value: boolean) {
+    if (!ids.length) return;
+    const now = new Date().toISOString();
+    if (value) {
+      const notSeparated = lines
+        .filter((l) => ids.includes(l.id) && !l.separated)
+        .map((l) => l.id);
+      if (notSeparated.length) {
+        const { error: sepErr } = await supabase
+          .from("event_sale_lines")
+          .update({ separated: true, separated_at: now, separated_by: meId })
+          .in("id", notSeparated);
+        if (sepErr) {
+          setError(sepErr.message);
+          return;
+        }
+      }
+    }
+    await patchLines(
+      ids,
+      {
+        boxed: value,
+        boxed_at: value ? now : null,
+        boxed_by: value ? meId : null,
+      },
+      value ? "Na caixa geral" : "Retirado da caixa geral",
     );
   }
 
@@ -1822,25 +1872,11 @@ export default function EventoDetailPage() {
 
   async function setArchived(ids: string[], archived: boolean) {
     if (!ids.length) return;
-    const { error: err } = await supabase
-      .from("event_sale_lines")
-      .update({ archived })
-      .in("id", ids);
-    if (err) {
-      setError(
-        err.message.includes("archived")
-          ? "Rode a migration migration_archive_lines.sql no Supabase (coluna archived)."
-          : err.message,
-      );
-      return;
-    }
-    setInfo(
-      archived
-        ? `Arquivado · ${ids.length} item(ns) (ficam na aba retrátil)`
-        : `Restaurado · ${ids.length} item(ns)`,
+    await patchLines(
+      ids,
+      { archived },
+      archived ? "Arquivado" : "Restaurado do arquivo",
     );
-    setSelectedLineIds({});
-    await load();
   }
 
   async function archiveAllHeartsInEvent() {
@@ -4669,6 +4705,23 @@ export default function EventoDetailPage() {
                       activeParticipant.phone,
                     )}
                   </h2>
+                  {activeParticipant.customer_id ? (
+                    activeHasPhysicalBox ? (
+                      <Badge
+                        tone="info"
+                        title="Cliente tem caixinha física unificada (saco grande)"
+                      >
+                        Caixinha física
+                        {activeCustomer?.physical_box_label
+                          ? ` · ${activeCustomer.physical_box_label}`
+                          : ""}
+                      </Badge>
+                    ) : (
+                      <span className="text-xs text-zinc-500">
+                        Sem caixinha física registrada
+                      </span>
+                    )
+                  ) : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
@@ -4730,6 +4783,21 @@ export default function EventoDetailPage() {
                   }
                 >
                   Marcar como separado
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={selectedCount === 0 || busy || !activeHasPhysicalBox}
+                  title={
+                    activeHasPhysicalBox
+                      ? "Último passo: as cartas já estão no saco grande do cliente"
+                      : "Registre a caixinha física na ficha do cliente primeiro"
+                  }
+                  onClick={() =>
+                    void markBoxed(selectedIdsFromParticipant(), true)
+                  }
+                >
+                  Colocar na caixa geral
                 </button>
                 <button
                   type="button"
@@ -4963,6 +5031,22 @@ export default function EventoDetailPage() {
                                 >
                                   {line.separated ? "Separado" : "Não separado"}
                                 </Badge>
+                                {line.boxed || activeHasPhysicalBox ? (
+                                  <Badge
+                                    tone={line.boxed ? "info" : "neutral"}
+                                    title={
+                                      line.boxed
+                                        ? `Na caixa geral desde ${line.boxed_at ? new Date(line.boxed_at).toLocaleString("pt-BR") : "—"} · clique para retirar`
+                                        : "Clique quando colocar no saco grande do cliente"
+                                    }
+                                    onClick={() => {
+                                      if (busy) return;
+                                      void markBoxed([line.id], !line.boxed);
+                                    }}
+                                  >
+                                    {line.boxed ? "Na caixa geral" : "Fora da caixa geral"}
+                                  </Badge>
+                                ) : null}
                                 <Badge
                                   tone={line.charged ? "warn" : "neutral"}
                                   title="Clique para inverter cobrança"
