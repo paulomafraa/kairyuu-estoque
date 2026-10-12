@@ -147,6 +147,7 @@ export default function ClientesPage() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [boxLabelById, setBoxLabelById] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     setError(null);
@@ -157,6 +158,15 @@ export default function ClientesPage() {
       setError(e instanceof Error ? e.message : String(e));
       return;
     }
+    const bx = await supabase.from("physical_boxes").select("id, label");
+    setBoxLabelById(
+      Object.fromEntries(
+        ((bx.data || []) as { id: string; label: string }[]).map((b) => [
+          b.id,
+          b.label,
+        ]),
+      ),
+    );
     const pageAll = <T,>(table: string, columns: string) =>
       fetchAllQueryRows<T>(
         (from, to) =>
@@ -622,7 +632,7 @@ export default function ClientesPage() {
         return false;
       }
       if (filter === "inativos_grupo" && !c.silentInactive) return false;
-      if (filter === "caixa_fisica" && !c.physical_box) return false;
+      if (filter === "caixa_fisica" && !c.physical_box_id) return false;
       return matchesSearch(c.searchHay, c.searchDigits);
     });
     if (filter !== "inativos_grupo") return rows;
@@ -649,7 +659,7 @@ export default function ClientesPage() {
     let inativosGrupo = 0;
     let caixaFisica = 0;
     for (const c of customers) {
-      if (c.physical_box) caixaFisica += 1;
+      if (c.physical_box_id) caixaFisica += 1;
       if (c.hasOrders) ativos += 1;
       else semPedidos += 1;
       if (c.pendencias > 0) pendencias += 1;
@@ -931,10 +941,12 @@ export default function ClientesPage() {
                           Caixinha/garagem ({c.caixinhaCount})
                         </Badge>
                       ) : null}
-                      {c.physical_box ? (
+                      {c.physical_box_id ? (
                         <Badge tone="info">
                           Caixinha física
-                          {c.physical_box_label ? ` · ${c.physical_box_label}` : ""}
+                          {boxLabelById[c.physical_box_id]
+                            ? ` · ${boxLabelById[c.physical_box_id]}`
+                            : ""}
                         </Badge>
                       ) : null}
                       {c.hasOrders ? (

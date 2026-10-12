@@ -55,6 +55,7 @@ import type {
   GarageItem,
   GarageOrigin,
   GarageStatus,
+  PhysicalBox,
 } from "@/lib/types";
 
 type Tab =
@@ -146,7 +147,9 @@ export default function ClienteDetailPage() {
 
   const [editName, setEditName] = useState("");
   const [editingName, setEditingName] = useState(false);
-  const [boxLabel, setBoxLabel] = useState("");
+  const [boxes, setBoxes] = useState<PhysicalBox[]>([]);
+  const [boxMates, setBoxMates] = useState<Customer[]>([]);
+  const [boxPick, setBoxPick] = useState("");
   const [editingBox, setEditingBox] = useState(false);
   const [openBoxedEvents, setOpenBoxedEvents] = useState<Record<string, boolean>>({});
 
@@ -198,7 +201,23 @@ export default function ClienteDetailPage() {
     const current = cu.data as Customer;
     setCustomer(current);
     setEditName(current.name);
-    setBoxLabel(current.physical_box_label || "");
+
+    const bx = await supabase
+      .from("physical_boxes")
+      .select("*")
+      .order("label", { ascending: true })
+      .order("id", { ascending: true });
+    setBoxes(bx.error ? [] : ((bx.data || []) as PhysicalBox[]));
+    if (current.physical_box_id) {
+      const mates = await supabase
+        .from("customers")
+        .select("*")
+        .eq("physical_box_id", current.physical_box_id)
+        .neq("id", customerId);
+      setBoxMates(mates.error ? [] : ((mates.data || []) as Customer[]));
+    } else {
+      setBoxMates([]);
+    }
 
     const phoneDigits =
       current.phone_digits || normalizePhoneDigits(current.phone || "");
@@ -339,59 +358,66 @@ export default function ClienteDetailPage() {
 
   function physicalBoxError(message: string) {
     return /physical_box|boxed/i.test(message)
-      ? `${message} — rode supabase/migration_physical_box.sql no Supabase.`
+      ? `${message} — rode supabase/migration_physical_boxes.sql no Supabase.`
       : message;
   }
 
-  async function savePhysicalBox(registered: boolean) {
-    const label = boxLabel.trim();
+  async function linkPhysicalBox() {
+    const label = boxPick.trim();
+    if (!label) return;
     setBusy(true);
     setError(null);
-    const patch = registered
-      ? {
-          physical_box: true,
-          physical_box_label: label,
-          ...(customer?.physical_box
-            ? {}
-            : {
-                physical_box_since: new Date().toISOString(),
-                physical_box_by: meId,
-              }),
-        }
-      : {
-          physical_box: false,
-          physical_box_label: "",
-          physical_box_since: null,
-          physical_box_by: null,
-        };
+    let box = boxes.find((b) => b.label.toLowerCase() === label.toLowerCase());
+    if (!box) {
+      const created = await supabase
+        .from("physical_boxes")
+        .insert({ label, created_by: meId })
+        .select("*")
+        .single();
+      if (created.error) {
+        setBusy(false);
+        setError(physicalBoxError(created.error.message));
+        return;
+      }
+      box = created.data as PhysicalBox;
+    }
     const { error: err } = await supabase
       .from("customers")
-      .update(patch)
+      .update({ physical_box_id: box.id })
       .eq("id", customerId);
     setBusy(false);
     if (err) {
       setError(physicalBoxError(err.message));
       return;
     }
-    const action = !registered
-      ? "physical_box_remove"
-      : customer?.physical_box
-        ? "physical_box_edit"
-        : "physical_box_register";
-    const detail = !registered
-      ? `Caixinha física removida · ${meName}`
-      : customer?.physical_box
-        ? `Caixinha física atualizada${label ? ` · ${label}` : ""} · ${meName}`
-        : `Caixinha física registrada${label ? ` · ${label}` : ""} · ${meName}`;
-    await logEvent(action, detail);
-    setInfo(
-      !registered
-        ? "Registro da caixinha física removido."
-        : customer?.physical_box
-          ? "Caixinha física atualizada."
-          : "Caixinha física registrada.",
+    await logEvent(
+      "physical_box_link",
+      `Vinculado à caixinha física · ${box.label} · ${meName}`,
     );
+    setInfo(`Cliente vinculado à caixinha "${box.label}".`);
     setEditingBox(false);
+    setBoxPick("");
+    await load();
+  }
+
+  async function unlinkPhysicalBox() {
+    const label = currentBox?.label || "";
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("customers")
+      .update({ physical_box_id: null })
+      .eq("id", customerId);
+    setBusy(false);
+    if (err) {
+      setError(physicalBoxError(err.message));
+      return;
+    }
+    await logEvent(
+      "physical_box_unlink",
+      `Desvinculado da caixinha física${label ? ` · ${label}` : ""} · ${meName}`,
+    );
+    setInfo("Cliente desvinculado da caixinha física.");
     await load();
   }
 
@@ -1045,6 +1071,14 @@ export default function ClienteDetailPage() {
       (b.eventDate || "").localeCompare(a.eventDate || ""),
     );
   }, [chargeLines]);
+
+  const currentBox = useMemo(
+    () =>
+      customer?.physical_box_id
+        ? boxes.find((b) => b.id === customer.physical_box_id) || null
+        : null,
+    [boxes, customer?.physical_box_id],
+  );
 
   const boxGroups = useMemo(() => {
     const itemById = new Map(items.map((i) => [i.id, i]));
@@ -1952,14 +1986,9 @@ export default function ClienteDetailPage() {
               cartas dentro dele — é o último passo.
             </p>
           </div>
-          {customer.physical_box ? (
+          {currentBox ? (
             <div className="flex flex-wrap gap-2">
-              <Badge tone="info">
-                Caixinha física
-                {customer.physical_box_label
-                  ? ` · ${customer.physical_box_label}`
-                  : ""}
-              </Badge>
+              <Badge tone="info">Caixinha física · {currentBox.label}</Badge>
               <Badge tone={boxTotals.toBox > 0 ? "warn" : "good"}>
                 {boxTotals.toBox > 0
                   ? `${boxTotals.toBox} para colocar`
@@ -1970,26 +1999,37 @@ export default function ClienteDetailPage() {
           ) : null}
         </div>
 
-        {!customer.physical_box || editingBox ? (
+        {!currentBox || editingBox ? (
           <div className="flex flex-wrap items-end gap-2 rounded-md border border-zinc-200 bg-zinc-50 p-3">
             <label className="min-w-[14rem] flex-1 text-sm">
               <span className="mb-1 block text-zinc-600">
-                Identificação (opcional)
+                Caixinha (escolha da lista ou digite um nome novo)
               </span>
               <input
                 className="field"
-                placeholder="Ex.: Saco 12 · prateleira B"
-                value={boxLabel}
-                onChange={(e) => setBoxLabel(e.target.value)}
+                list="physical-box-options"
+                placeholder="Digite para buscar…"
+                value={boxPick}
+                onChange={(e) => setBoxPick(e.target.value)}
               />
+              <datalist id="physical-box-options">
+                {boxes.map((b) => (
+                  <option key={b.id} value={b.label} />
+                ))}
+              </datalist>
             </label>
             <button
               type="button"
               className="btn-primary"
-              disabled={busy}
-              onClick={() => void savePhysicalBox(true)}
+              disabled={busy || !boxPick.trim()}
+              onClick={() => void linkPhysicalBox()}
             >
-              {customer.physical_box ? "Salvar" : "Registrar caixinha física"}
+              {boxPick.trim() &&
+              !boxes.some(
+                (b) => b.label.toLowerCase() === boxPick.trim().toLowerCase(),
+              )
+                ? "Criar caixinha e vincular"
+                : "Vincular"}
             </button>
             {editingBox ? (
               <button
@@ -1997,36 +2037,61 @@ export default function ClienteDetailPage() {
                 className="btn-secondary"
                 onClick={() => {
                   setEditingBox(false);
-                  setBoxLabel(customer.physical_box_label || "");
+                  setBoxPick("");
                 }}
               >
                 Cancelar
               </button>
             ) : null}
+            <Link
+              href="/caixinhas"
+              className="text-xs font-medium text-sky-800 underline"
+            >
+              Ver todas as caixinhas
+            </Link>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-3 text-sm text-zinc-600">
-            <span>
-              Desde {fmtDate(customer.physical_box_since)}
-            </span>
+            {boxMates.length > 0 ? (
+              <span>
+                Divide com{" "}
+                {boxMates.map((m, i) => (
+                  <span key={m.id}>
+                    {i > 0 ? ", " : ""}
+                    <Link
+                      href={`/clientes/${m.id}`}
+                      className="font-medium text-zinc-900 underline decoration-zinc-300 underline-offset-2"
+                    >
+                      {m.name}
+                    </Link>
+                  </span>
+                ))}
+              </span>
+            ) : null}
+            <Link
+              href="/caixinhas"
+              className="text-xs font-medium text-sky-800 underline"
+            >
+              Ver todas as caixinhas
+            </Link>
             <button
               type="button"
               className="text-xs font-medium text-sky-800 underline"
               onClick={() => setEditingBox(true)}
             >
-              Editar identificação
+              Trocar caixinha
             </button>
             <ConfirmButton
-              label="Remover registro"
-              confirmLabel="Remover a caixinha física?"
+              label="Desvincular"
+              confirmLabel="Desvincular desta caixinha?"
               className="text-xs font-medium text-red-700 underline"
               disabled={busy}
-              onConfirm={() => savePhysicalBox(false)}
+              onConfirm={() => unlinkPhysicalBox()}
             />
           </div>
         )}
 
-        {customer.physical_box ? (
+        {currentBox ? (
           boxGroups.length === 0 ? (
             <p className="text-sm text-zinc-500">
               Nenhuma carta de evento guardada para este cliente.

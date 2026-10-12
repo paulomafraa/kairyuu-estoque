@@ -122,11 +122,16 @@ export type Customer = {
   source?: "manual" | "whatsapp_group";
   notes: string;
   created_at: string;
-  /** Saco/caixa física unificada com tudo que o cliente tem guardado. */
-  physical_box?: boolean;
-  physical_box_label?: string;
-  physical_box_since?: string | null;
-  physical_box_by?: string | null;
+  /** Saco/caixa física unificada onde ficam as cartas do cliente (pode ser compartilhada). */
+  physical_box_id?: string | null;
+};
+
+export type PhysicalBox = {
+  id: string;
+  label: string;
+  notes: string;
+  created_at: string;
+  created_by: string | null;
 };
 
 export type Event = {

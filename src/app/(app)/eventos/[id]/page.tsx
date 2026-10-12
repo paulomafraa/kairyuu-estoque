@@ -82,6 +82,7 @@ import type {
   EventProductStock,
   EventSaleLine,
   GarageItem,
+  PhysicalBox,
   Profile,
 } from "@/lib/types";
 
@@ -242,6 +243,7 @@ export default function EventoDetailPage() {
   const [garageById, setGarageById] = useState<Record<string, GarageItem>>({});
   const [productStock, setProductStock] = useState<EventProductStock[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
+  const [physicalBoxes, setPhysicalBoxes] = useState<PhysicalBox[]>([]);
   const [allocations, setAllocations] = useState<EventAllocation[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
   const [meId, setMeId] = useState<string | null>(null);
@@ -470,6 +472,8 @@ export default function EventoDetailPage() {
       setProductCosts((costs.data as EventProductCost[]) || []);
     }
     setCustomers(await customersPromise);
+    const bx = await supabase.from("physical_boxes").select("*");
+    setPhysicalBoxes(bx.error ? [] : ((bx.data || []) as PhysicalBox[]));
   }, [supabase, eventId]);
 
   useEffect(() => {
@@ -587,7 +591,10 @@ export default function EventoDetailPage() {
   const activeCustomer = activeParticipant?.customer_id
     ? customers.find((c) => c.id === activeParticipant.customer_id) || null
     : null;
-  const activeHasPhysicalBox = Boolean(activeCustomer?.physical_box);
+  const activePhysicalBox = activeCustomer?.physical_box_id
+    ? physicalBoxes.find((b) => b.id === activeCustomer.physical_box_id) || null
+    : null;
+  const activeHasPhysicalBox = Boolean(activePhysicalBox);
 
   const activeMainLines = useMemo(
     () =>
@@ -4711,10 +4718,7 @@ export default function EventoDetailPage() {
                         tone="info"
                         title="Cliente tem caixinha física unificada (saco grande)"
                       >
-                        Caixinha física
-                        {activeCustomer?.physical_box_label
-                          ? ` · ${activeCustomer.physical_box_label}`
-                          : ""}
+                        Caixinha física · {activePhysicalBox?.label}
                       </Badge>
                     ) : (
                       <span className="text-xs text-zinc-500">
