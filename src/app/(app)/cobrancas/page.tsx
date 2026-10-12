@@ -13,15 +13,44 @@ import {
   BILLING_STATUS_LABEL,
   buildBillingDraft,
   fantasyBillingText,
+  isBillableOpenLine,
   parseTestRecipients,
   type BillingDraftItem,
   type BillingDraftProblem,
   type BillingRun,
   type BillingSourceLine,
 } from "@/lib/billing";
+import {
+  buildPhoneLookup,
+  customerPhoneDigits,
+  fetchCustomersSharingPhone,
+  fetchSaleLinesForCustomer,
+  phoneInLookup,
+} from "@/lib/customers";
+import { parseMoneyFromOption } from "@/lib/leilao-resultado";
 import type { Event } from "@/lib/types";
 
 type EventRow = Pick<Event, "id" | "name" | "opened_at" | "kind" | "status" | "payment_due_at">;
+
+type PickCustomer = { id: string; name: string; phone: string; phone_digits?: string | null };
+
+type JoinedRun = { name: string; status?: string; is_test: boolean };
+
+const DUPLICATE_RECENT_DAYS = 3;
+
+function draftKey(it: BillingDraftItem) {
+  return `${it.phone_digits}|${it.event_ids.join(",")}`;
+}
+
+function sourceLinePrice(l: BillingSourceLine): number | null {
+  if (l.unit_price != null && Number.isFinite(Number(l.unit_price))) return Number(l.unit_price);
+  return parseMoneyFromOption(l.product_title) ?? parseMoneyFromOption(l.valor_ou_opcao || "");
+}
+
+function joinedRun(v: JoinedRun | JoinedRun[] | null | undefined): JoinedRun | null {
+  if (!v) return null;
+  return Array.isArray(v) ? v[0] || null : v;
+}
 
 type RunCounts = { total: number; sent: number; pending: number; failed: number; replies: number; hints: number };
 
@@ -69,6 +98,15 @@ export default function CobrancasPage() {
     problems: BillingDraftProblem[];
   } | null>(null);
   const [previewIdx, setPreviewIdx] = useState(0);
+  const [source, setSource] = useState<"eventos" | "clientes">("eventos");
+  const [custQuery, setCustQuery] = useState("");
+  const [custResults, setCustResults] = useState<PickCustomer[]>([]);
+  const [picked, setPicked] = useState<PickCustomer[]>([]);
+  const [custLines, setCustLines] = useState<Record<string, BillingSourceLine[]>>({});
+  const [offEvents, setOffEvents] = useState<Set<string>>(new Set());
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  const [dupes, setDupes] = useState<Record<string, string[]>>({});
+  const [draftSearch, setDraftSearch] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -160,6 +198,157 @@ export default function CobrancasPage() {
     return out;
   }
 
+  useEffect(() => {
+    const q = custQuery.trim();
+    if (source !== "clientes" || q.length < 2) return;
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      const digits = q.replace(/\D/g, "");
+      const safe = q.replace(/[%,()]/g, " ");
+      const orFilter =
+        digits.length >= 4
+          ? `name.ilike.%${safe}%,phone_digits.ilike.%${digits}%`
+          : `name.ilike.%${safe}%`;
+      const { data } = await supabase
+        .from("customers")
+        .select("id, name, phone, phone_digits")
+        .or(orFilter)
+        .order("name", { ascending: true })
+        .limit(12);
+      if (!cancelled) setCustResults((data || []) as PickCustomer[]);
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [custQuery, source, supabase]);
+
+  async function addCustomer(c: PickCustomer) {
+    if (picked.some((p) => p.id === c.id)) return;
+    setPicked((prev) => [...prev, c]);
+    setCustQuery("");
+    setDraft(null);
+    try {
+      const phone = customerPhoneDigits({ phone: c.phone, phone_digits: c.phone_digits });
+      const related = await fetchCustomersSharingPhone(supabase, c.id, phone).catch(() => []);
+      const ids = [...new Set([c.id, ...related.map((r) => r.id)])];
+      const rows = await fetchSaleLinesForCustomer<BillingSourceLine>(supabase, {
+        customerIds: ids,
+        phoneDigits: phone,
+        select: LINE_SELECT,
+        cancelled: false,
+      });
+      const open = rows
+        .filter((l) => !l.paid)
+        .map((l) => ({
+          ...l,
+          customer_id: c.id,
+          phone_digits: phone || l.phone_digits,
+          customers: { id: c.id, name: c.name, phone: c.phone },
+        }));
+      setCustLines((prev) => ({ ...prev, [c.id]: open }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setCustLines((prev) => ({ ...prev, [c.id]: [] }));
+    }
+  }
+
+  function removeCustomer(id: string) {
+    setPicked((prev) => prev.filter((p) => p.id !== id));
+    setDraft(null);
+  }
+
+  function toggleCustomerEvent(customerId: string, eventId: string) {
+    const key = `${customerId}:${eventId}`;
+    setOffEvents((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+    setDraft(null);
+  }
+
+  function customerEventSummary(customerId: string) {
+    const rows = custLines[customerId];
+    if (!rows) return null;
+    const byEvent = new Map<
+      string,
+      { eventId: string; name: string; kind: string; day: string | null; count: number; total: number; missing: number }
+    >();
+    for (const l of rows) {
+      if (!isBillableOpenLine(l, includeCharged)) continue;
+      let ev = byEvent.get(l.event_id);
+      if (!ev) {
+        ev = {
+          eventId: l.event_id,
+          name: l.events?.name || "Evento",
+          kind: l.events?.kind || "outro",
+          day: eventHappenedOn({ name: l.events?.name, opened_at: l.events?.opened_at }),
+          count: 0,
+          total: 0,
+          missing: 0,
+        };
+        byEvent.set(l.event_id, ev);
+      }
+      const qty = Number(l.qty) > 0 ? Number(l.qty) : 1;
+      const price = sourceLinePrice(l);
+      ev.count += 1;
+      if (price == null) ev.missing += 1;
+      else ev.total += price * qty;
+    }
+    return [...byEvent.values()].sort((a, b) => (b.day || "").localeCompare(a.day || ""));
+  }
+
+  /** Cliente já numa lista que ainda não terminou, ou cobrado nos últimos dias. */
+  async function findDuplicates(items: BillingDraftItem[]) {
+    const since = new Date(Date.now() - DUPLICATE_RECENT_DAYS * 86_400_000).toISOString();
+    const [act, rec] = await Promise.all([
+      supabase
+        .from("billing_items")
+        .select("phone_digits, billing_runs!inner(name, status, is_test)")
+        .in("status", ["pending", "sending"])
+        .in("billing_runs.status", ["draft", "running", "paused"])
+        .eq("billing_runs.is_test", false)
+        .limit(5000),
+      supabase
+        .from("billing_items")
+        .select("phone_digits, sent_at, billing_runs!inner(name, is_test)")
+        .eq("status", "sent")
+        .gte("sent_at", since)
+        .eq("billing_runs.is_test", false)
+        .limit(5000),
+    ]);
+    const active = (act.data || []) as unknown as Array<{
+      phone_digits: string;
+      billing_runs: JoinedRun | JoinedRun[] | null;
+    }>;
+    const recent = (rec.data || []) as unknown as Array<{
+      phone_digits: string;
+      sent_at: string;
+      billing_runs: JoinedRun | JoinedRun[] | null;
+    }>;
+    const warnings: Record<string, string[]> = {};
+    const blocked = new Set<string>();
+    for (const it of items) {
+      const lookup = buildPhoneLookup([it.phone_digits]);
+      const msgs: string[] = [];
+      for (const a of active) {
+        if (!phoneInLookup(a.phone_digits, lookup)) continue;
+        msgs.push(`Já está na lista "${joinedRun(a.billing_runs)?.name || "?"}" (ainda não enviada)`);
+        blocked.add(draftKey(it));
+      }
+      for (const r of recent) {
+        if (!phoneInLookup(r.phone_digits, lookup)) continue;
+        msgs.push(
+          `Cobrado em ${new Date(r.sent_at).toLocaleString("pt-BR")} na lista "${joinedRun(r.billing_runs)?.name || "?"}"`,
+        );
+      }
+      if (msgs.length) warnings[draftKey(it)] = [...new Set(msgs)];
+    }
+    return { warnings, blocked };
+  }
+
   async function buildPreview() {
     setError(null);
     setInfo(null);
@@ -168,15 +357,28 @@ export default function CobrancasPage() {
       setError("Lista de teste: coloque pelo menos 1 número (um por linha).");
       return;
     }
-    if (!isTest && !selected.size) {
+    if (!isTest && source === "eventos" && !selected.size) {
       setError("Escolha pelo menos 1 evento.");
+      return;
+    }
+    if (!isTest && source === "clientes" && !picked.length) {
+      setError("Escolha pelo menos 1 cliente.");
+      return;
+    }
+    if (source === "clientes" && picked.some((p) => !custLines[p.id])) {
+      setError("Espere carregar as cartas de todos os clientes escolhidos.");
       return;
     }
     setBusy(true);
     try {
       let built = { items: [] as BillingDraftItem[], problems: [] as BillingDraftProblem[] };
-      if (selected.size) {
+      if (source === "eventos" && selected.size) {
         const lines = await fetchLines([...selected]);
+        built = buildBillingDraft(lines, { mode, includeCharged });
+      } else if (source === "clientes" && picked.length) {
+        const lines = picked.flatMap((c) =>
+          (custLines[c.id] || []).filter((l) => !offEvents.has(`${c.id}:${l.event_id}`)),
+        );
         built = buildBillingDraft(lines, { mode, includeCharged });
       }
       if (isTest) {
@@ -199,6 +401,15 @@ export default function CobrancasPage() {
           }),
         };
       }
+      if (isTest) {
+        setDupes({});
+        setExcluded(new Set());
+      } else {
+        const { warnings, blocked } = await findDuplicates(built.items);
+        setDupes(warnings);
+        setExcluded(blocked);
+      }
+      setDraftSearch("");
       setDraft(built);
       setPreviewIdx(0);
     } catch (e) {
@@ -209,16 +420,24 @@ export default function CobrancasPage() {
   }
 
   async function createRun() {
-    if (!draft?.items.length) return;
+    const chosen = (draft?.items || []).filter((it) => !excluded.has(draftKey(it)));
+    if (!chosen.length) return;
     setBusy(true);
     setError(null);
     try {
       const auth = await supabase.auth.getUser();
       const meId = auth.data.user?.id || null;
-      const evNames = events
-        .filter((e) => selected.has(e.id))
-        .map((e) => e.name)
-        .join(" + ");
+      const runEventIds =
+        source === "eventos"
+          ? [...selected]
+          : [...new Set(chosen.flatMap((it) => it.event_ids))];
+      const evNames =
+        source === "eventos"
+          ? events
+              .filter((e) => selected.has(e.id))
+              .map((e) => e.name)
+              .join(" + ")
+          : `Por cliente (${new Set(chosen.map((it) => it.phone_digits)).size})`;
       const runName =
         name.trim() ||
         `${isTest ? "TESTE · " : ""}${evNames || "Cobrança"} · ${new Date().toLocaleDateString("pt-BR")}`;
@@ -229,13 +448,13 @@ export default function CobrancasPage() {
           mode,
           status: "draft",
           is_test: isTest,
-          event_ids: [...selected],
+          event_ids: runEventIds,
           created_by: meId,
         })
         .select("*")
         .single();
       if (runErr) throw runErr;
-      const rows = draft.items.map((it, i) => ({
+      const rows = chosen.map((it, i) => ({
         run_id: (run as BillingRun).id,
         position: i + 1,
         customer_id: it.customer_id,
@@ -259,10 +478,36 @@ export default function CobrancasPage() {
     }
   }
 
-  const draftTotal = useMemo(
-    () => (draft?.items || []).reduce((s, it) => s + (it.total || 0), 0),
-    [draft],
+  const draftChosen = useMemo(
+    () => (draft?.items || []).filter((it) => !excluded.has(draftKey(it))),
+    [draft, excluded],
   );
+  const draftTotal = useMemo(
+    () => draftChosen.reduce((s, it) => s + (it.total || 0), 0),
+    [draftChosen],
+  );
+  const draftVisible = useMemo(() => {
+    const q = draftSearch.trim().toLowerCase();
+    return (draft?.items || [])
+      .map((it, idx) => ({ it, idx }))
+      .filter(
+        ({ it }) =>
+          !q ||
+          it.customer_name.toLowerCase().includes(q) ||
+          it.phone_digits.includes(q.replace(/\D/g, "") || "\u0000"),
+      );
+  }, [draft, draftSearch]);
+
+  function setDraftChecked(keys: string[], checked: boolean) {
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      for (const k of keys) {
+        if (checked) next.delete(k);
+        else next.add(k);
+      }
+      return next;
+    });
+  }
   const preview = draft?.items[previewIdx];
 
   return (
@@ -382,6 +627,120 @@ export default function CobrancasPage() {
             </div>
 
             <div>
+              <div className="mb-2 flex gap-1">
+                {(
+                  [
+                    ["eventos", "Por eventos"],
+                    ["clientes", "Por clientes"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => {
+                      setSource(key);
+                      setDraft(null);
+                    }}
+                    className={
+                      source === key
+                        ? "rounded-md bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white"
+                        : "rounded-md border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50"
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {source === "clientes" ? (
+                <div>
+                  <span className="text-sm font-medium text-zinc-700">
+                    Clientes ({picked.length} escolhido{picked.length === 1 ? "" : "s"})
+                  </span>
+                  <p className="text-xs text-zinc-500">
+                    Busque e adicione. Aparecem os eventos em aberto de cada um (todas as rodadas) — desmarque o que não
+                    quer cobrar.
+                  </p>
+                  <div className="relative mt-1">
+                    <input
+                      value={custQuery}
+                      onChange={(e) => setCustQuery(e.target.value)}
+                      placeholder="Nome ou telefone…"
+                      className="w-full rounded-md border border-zinc-300 px-3 py-2 text-sm"
+                    />
+                    {custQuery.trim().length >= 2 && custResults.length ? (
+                      <ul className="absolute z-10 mt-1 max-h-60 w-full overflow-y-auto rounded-md border border-zinc-200 bg-white text-sm shadow">
+                        {custResults.map((c) => {
+                          const already = picked.some((p) => p.id === c.id);
+                          return (
+                            <li key={c.id}>
+                              <button
+                                type="button"
+                                disabled={already}
+                                onClick={() => void addCustomer(c)}
+                                className="flex w-full justify-between px-3 py-1.5 text-left hover:bg-zinc-50 disabled:opacity-50"
+                              >
+                                <span className="truncate">{c.name}</span>
+                                <span className="text-xs text-zinc-500">{already ? "já adicionado" : c.phone}</span>
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : null}
+                  </div>
+                  <div className="mt-2 max-h-80 space-y-2 overflow-y-auto">
+                    {picked.map((c) => {
+                      const evs = customerEventSummary(c.id);
+                      return (
+                        <div key={c.id} className="rounded-md border border-zinc-200 p-2 text-sm">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-medium text-zinc-900">
+                              {c.name} <span className="text-xs font-normal text-zinc-500">{c.phone}</span>
+                            </span>
+                            <button
+                              type="button"
+                              className="text-xs text-zinc-500 hover:text-red-700"
+                              onClick={() => removeCustomer(c.id)}
+                            >
+                              remover
+                            </button>
+                          </div>
+                          {evs == null ? (
+                            <p className="mt-1 text-xs text-zinc-500">Carregando cartas…</p>
+                          ) : evs.length === 0 ? (
+                            <p className="mt-1 text-xs text-zinc-500">
+                              Nada em aberto para cobrar
+                              {includeCharged ? "" : " (quem já foi cobrado só entra marcando o lembrete)"}.
+                            </p>
+                          ) : (
+                            <ul className="mt-1 space-y-0.5">
+                              {evs.map((ev) => (
+                                <li key={ev.eventId}>
+                                  <label className="flex cursor-pointer items-center gap-2 text-xs">
+                                    <input
+                                      type="checkbox"
+                                      checked={!offEvents.has(`${c.id}:${ev.eventId}`)}
+                                      onChange={() => toggleCustomerEvent(c.id, ev.eventId)}
+                                    />
+                                    <span className="flex-1 truncate">
+                                      {kindLabel(ev.kind)} · {fmtDay(ev.day)} · {ev.name}
+                                    </span>
+                                    <span className="text-zinc-500">
+                                      {ev.count} item(ns) · R$ {formatMoneyBr(ev.total)}
+                                      {ev.missing ? <span className="text-red-700"> · {ev.missing} sem preço</span> : null}
+                                    </span>
+                                  </label>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+              <>
               <span className="text-sm font-medium text-zinc-700">
                 Eventos ({selected.size} escolhido{selected.size === 1 ? "" : "s"})
               </span>
@@ -406,6 +765,8 @@ export default function CobrancasPage() {
                   );
                 })}
               </div>
+              </>
+              )}
             </div>
           </div>
 
@@ -421,11 +782,11 @@ export default function CobrancasPage() {
             {draft?.items.length ? (
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || !draftChosen.length}
                 onClick={() => void createRun()}
                 className="rounded-md bg-zinc-900 px-3 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
               >
-                Criar lista ({draft.items.length})
+                Criar lista ({draftChosen.length})
               </button>
             ) : null}
           </div>
@@ -434,8 +795,15 @@ export default function CobrancasPage() {
             <div className="mt-4 grid gap-4 lg:grid-cols-2">
               <div className="text-sm">
                 <p className="font-medium text-zinc-800">
-                  {draft.items.length} cobrança(s) · total R$ {formatMoneyBr(draftTotal)}
+                  {draftChosen.length} de {draft.items.length} cobrança(s) marcadas · total R${" "}
+                  {formatMoneyBr(draftTotal)}
                 </p>
+                {Object.keys(dupes).length ? (
+                  <p className="mt-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                    {Object.keys(dupes).length} cliente(s) com aviso de cobrança dupla (em amarelo). Quem já está em
+                    outra lista não enviada veio desmarcado.
+                  </p>
+                ) : null}
                 {draft.problems.length ? (
                   <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800">
                     <p className="font-semibold">
@@ -451,23 +819,64 @@ export default function CobrancasPage() {
                     </ul>
                   </div>
                 ) : null}
-                <ul className="mt-2 max-h-64 overflow-y-auto rounded-md border border-zinc-200 text-xs">
-                  {draft.items.map((it, i) => (
-                    <li key={i}>
-                      <button
-                        type="button"
-                        onClick={() => setPreviewIdx(i)}
-                        className={`flex w-full justify-between px-2 py-1 text-left hover:bg-zinc-50 ${
-                          i === previewIdx ? "bg-zinc-100" : ""
-                        }`}
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <input
+                    value={draftSearch}
+                    onChange={(e) => setDraftSearch(e.target.value)}
+                    placeholder="Buscar na prévia…"
+                    className="min-w-0 flex-1 rounded-md border border-zinc-300 px-2 py-1 text-xs"
+                  />
+                  <button
+                    type="button"
+                    className="text-xs text-sky-800 underline"
+                    onClick={() => setDraftChecked(draftVisible.map(({ it }) => draftKey(it)), true)}
+                  >
+                    marcar todos
+                  </button>
+                  <button
+                    type="button"
+                    className="text-xs text-sky-800 underline"
+                    onClick={() => setDraftChecked(draftVisible.map(({ it }) => draftKey(it)), false)}
+                  >
+                    desmarcar todos
+                  </button>
+                </div>
+                <ul className="mt-2 max-h-80 overflow-y-auto rounded-md border border-zinc-200 text-xs">
+                  {draftVisible.map(({ it, idx }) => {
+                    const key = draftKey(it);
+                    const checked = !excluded.has(key);
+                    const warn = dupes[key];
+                    return (
+                      <li
+                        key={key + idx}
+                        className={`flex items-start gap-2 border-b border-zinc-100 px-2 py-1 last:border-0 ${
+                          idx === previewIdx ? "bg-zinc-100" : ""
+                        } ${warn ? "bg-amber-50" : ""}`}
                       >
-                        <span className="truncate">
-                          {i + 1}. {it.customer_name}
-                        </span>
-                        <span className="text-zinc-500">R$ {formatMoneyBr(it.total)}</span>
-                      </button>
-                    </li>
-                  ))}
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={checked}
+                          onChange={(e) => setDraftChecked([key], e.target.checked)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setPreviewIdx(idx)}
+                          className={`min-w-0 flex-1 text-left ${checked ? "" : "text-zinc-400 line-through"}`}
+                        >
+                          <span className="flex justify-between gap-2">
+                            <span className="truncate">
+                              {idx + 1}. {it.customer_name}
+                            </span>
+                            <span className="text-zinc-500">R$ {formatMoneyBr(it.total)}</span>
+                          </span>
+                          {warn ? (
+                            <span className="block text-amber-800 no-underline">{warn.join(" · ")}</span>
+                          ) : null}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
               {preview ? (
