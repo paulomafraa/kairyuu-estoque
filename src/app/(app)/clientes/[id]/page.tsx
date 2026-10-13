@@ -831,6 +831,49 @@ export default function ClienteDetailPage() {
     await load();
   }
 
+  async function moveEventBetweenShipments(
+    eventKey: string,
+    fromShipmentId: string,
+    toShipmentId: string,
+  ) {
+    const from = shipments.find((s) => s.id === fromShipmentId);
+    const to = shipments.find((s) => s.id === toShipmentId);
+    if (!from || !to) {
+      setError("Pacote não encontrado.");
+      return;
+    }
+    const targets = sent.filter(
+      (i) => eventBundleKey(i) === eventKey && i.shipment_id === fromShipmentId,
+    );
+    if (!targets.length) {
+      setError("Nada desse evento neste pacote.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("customer_garage_items")
+      .update({ shipment_id: toShipmentId, shipped_on: to.shipped_on })
+      .in(
+        "id",
+        targets.map((t) => t.id),
+      );
+    setBusy(false);
+    if (err) {
+      setError(err.message);
+      return;
+    }
+    const eventLabel = targets[0]?.event_name || "evento";
+    await logEvent(
+      "move_shipment",
+      `${eventLabel} · ${targets.length} item(ns) movidos do pacote ${fmtDay(from.shipped_on)} para ${fmtDay(to.shipped_on)} · por ${meName}`,
+    );
+    setInfo(
+      `${eventLabel} movido para o pacote de ${fmtDay(to.shipped_on)}.`,
+    );
+    await load();
+  }
+
   async function cancelItem(item: GarageItem, reason: string) {
     setError(null);
     const { error: err } = await supabase
@@ -2468,6 +2511,7 @@ export default function ClienteDetailPage() {
             onShipEventToShipment={shipEventToShipment}
             onAttachSentEventToShipment={attachSentEventToShipment}
             onShipEventAlone={shipEventAlone}
+            onMoveEventBetweenShipments={moveEventBetweenShipments}
             onDeleteShipment={deleteShipment}
           />
 

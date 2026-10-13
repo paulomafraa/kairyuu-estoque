@@ -30,6 +30,11 @@ type Props = {
     shipmentId: string,
   ) => Promise<void>;
   onShipEventAlone: (eventKey: string, shippedOn: string) => Promise<void>;
+  onMoveEventBetweenShipments: (
+    eventKey: string,
+    fromShipmentId: string,
+    toShipmentId: string,
+  ) => Promise<void>;
   onDeleteShipment: (shipmentId: string) => Promise<void>;
 };
 
@@ -100,13 +105,15 @@ export function CustomerShipmentsBoard({
   onShipEventToShipment,
   onAttachSentEventToShipment,
   onShipEventAlone,
+  onMoveEventBetweenShipments,
   onDeleteShipment,
 }: Props) {
   const [view, setView] = useState<"quadro" | "lista">("quadro");
   const [shippedOn, setShippedOn] = useState(todayISO());
   const [label, setLabel] = useState("");
   const [dragKey, setDragKey] = useState<string | null>(null);
-  const [dragKind, setDragKind] = useState<"garage" | "sent" | null>(null);
+  const [dragKind, setDragKind] = useState<"garage" | "sent" | "shipment" | null>(null);
+  const [dragFromShipment, setDragFromShipment] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
 
   const garageBundles = useMemo(
@@ -144,13 +151,21 @@ export function CustomerShipmentsBoard({
   async function handleDropOnShipment(shipmentId: string) {
     if (!dragKey || !dragKind) return;
     setDropTarget(null);
-    if (dragKind === "garage") {
-      await onShipEventToShipment(dragKey, shipmentId);
-    } else {
-      await onAttachSentEventToShipment(dragKey, shipmentId);
-    }
+    const key = dragKey;
+    const kind = dragKind;
+    const from = dragFromShipment;
     setDragKey(null);
     setDragKind(null);
+    setDragFromShipment(null);
+    if (kind === "garage") {
+      await onShipEventToShipment(key, shipmentId);
+    } else if (kind === "shipment") {
+      if (from && from !== shipmentId) {
+        await onMoveEventBetweenShipments(key, from, shipmentId);
+      }
+    } else {
+      await onAttachSentEventToShipment(key, shipmentId);
+    }
   }
 
   return (
@@ -260,7 +275,7 @@ export function CustomerShipmentsBoard({
                         <div className="mt-2 flex flex-wrap gap-2">
                           <button
                             type="button"
-                            className="btn-secondary px-2 py-1 text-xs"
+                            className="btn-primary px-2 py-1 text-xs"
                             disabled={busy || shipmentsSorted.length === 0}
                             title={
                               shipmentsSorted.length
@@ -278,7 +293,7 @@ export function CustomerShipmentsBoard({
                           </button>
                           <button
                             type="button"
-                            className="btn-primary px-2 py-1 text-xs"
+                            className="btn-secondary px-2 py-1 text-xs"
                             disabled={busy}
                             onClick={() =>
                               void onShipEventAlone(b.key, shippedOn)
@@ -405,10 +420,51 @@ export function CustomerShipmentsBoard({
                         {bundles.map((b) => (
                           <li
                             key={b.key}
-                            className="rounded-xl border border-zinc-200 bg-zinc-50/80 p-3"
+                            draggable={!busy}
+                            title="Arraste para outro pacote"
+                            onDragStart={() => {
+                              setDragKey(b.key);
+                              setDragKind("shipment");
+                              setDragFromShipment(ship.id);
+                            }}
+                            onDragEnd={() => {
+                              setDragKey(null);
+                              setDragKind(null);
+                              setDragFromShipment(null);
+                              setDropTarget(null);
+                            }}
+                            className={`cursor-grab rounded-xl border border-zinc-200 bg-zinc-50/80 p-3 active:cursor-grabbing ${
+                              dragKind === "shipment" && dragKey === b.key && dragFromShipment === ship.id
+                                ? "opacity-50"
+                                : ""
+                            }`}
                           >
-                            <div className="font-medium text-zinc-900">
-                              {b.label}
+                            <div className="flex items-start justify-between gap-2">
+                              <span className="font-medium text-zinc-900">
+                                {b.label}
+                              </span>
+                              {shipmentsSorted.length > 1 ? (
+                                <select
+                                  className="max-w-[9rem] rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs text-zinc-700"
+                                  value=""
+                                  disabled={busy}
+                                  title="Mover este evento para outro pacote"
+                                  onChange={(e) => {
+                                    const to = e.target.value;
+                                    if (to) void onMoveEventBetweenShipments(b.key, ship.id, to);
+                                  }}
+                                >
+                                  <option value="">Mover para…</option>
+                                  {shipmentsSorted
+                                    .filter((s) => s.id !== ship.id)
+                                    .map((s) => (
+                                      <option key={s.id} value={s.id}>
+                                        {fmtDay(s.shipped_on)}
+                                        {s.label ? ` · ${s.label}` : ""}
+                                      </option>
+                                    ))}
+                                </select>
+                              ) : null}
                             </div>
                             {b.eventDate ? (
                               <div className="text-xs text-zinc-500">
