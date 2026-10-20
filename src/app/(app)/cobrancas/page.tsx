@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
@@ -21,12 +21,20 @@ import {
   type BillingSourceLine,
 } from "@/lib/billing";
 import {
+  buildPhoneCustomerIndex,
   buildPhoneLookup,
   customerPhoneDigits,
+  fetchAllQueryRows,
   fetchCustomersSharingPhone,
   fetchSaleLinesForCustomer,
   phoneInLookup,
 } from "@/lib/customers";
+import {
+  buildSheetBillingDraft,
+  parseBillingXlsxFile,
+  type SheetBillingGroup,
+} from "@/lib/billing-sheet";
+import type { Customer } from "@/lib/types";
 import { parseMoneyFromOption } from "@/lib/leilao-resultado";
 import type { Event } from "@/lib/types";
 
@@ -98,7 +106,7 @@ export default function CobrancasPage() {
     problems: BillingDraftProblem[];
   } | null>(null);
   const [previewIdx, setPreviewIdx] = useState(0);
-  const [source, setSource] = useState<"eventos" | "clientes">("eventos");
+  const [source, setSource] = useState<"eventos" | "clientes" | "planilha">("eventos");
   const [custQuery, setCustQuery] = useState("");
   const [custResults, setCustResults] = useState<PickCustomer[]>([]);
   const [picked, setPicked] = useState<PickCustomer[]>([]);
@@ -107,6 +115,13 @@ export default function CobrancasPage() {
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const [dupes, setDupes] = useState<Record<string, string[]>>({});
   const [draftSearch, setDraftSearch] = useState("");
+  const sheetFile = useRef<File | null>(null);
+  const [sheetNames, setSheetNames] = useState<string[]>([]);
+  const [sheetUsed, setSheetUsed] = useState("");
+  const [sheetDate, setSheetDate] = useState("");
+  const [paymentDue, setPaymentDue] = useState("");
+  const [sheetGroups, setSheetGroups] = useState<SheetBillingGroup[] | null>(null);
+  const [sheetMeta, setSheetMeta] = useState<{ lines: number; paid: number } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -349,6 +364,26 @@ export default function CobrancasPage() {
     return { warnings, blocked };
   }
 
+  async function loadSheet(file: File, sheetName?: string) {
+    setError(null);
+    setInfo(null);
+    setDraft(null);
+    const parsed = await parseBillingXlsxFile(file, sheetName);
+    sheetFile.current = file;
+    setSheetNames(parsed.sheets);
+    setSheetUsed(parsed.sheetUsed);
+    setSheetDate(parsed.eventDate || "");
+    setSheetGroups(parsed.groups);
+    setSheetMeta({ lines: parsed.lineCount, paid: parsed.paidSkipped });
+    if (!parsed.sheets.length) {
+      setError("Nenhuma aba com as colunas Item, Valor, Cliente e Contato.");
+      return;
+    }
+    setName((prev) =>
+      prev.trim() && !prev.startsWith("Pré-venda · ") ? prev : `Pré-venda · ${parsed.sheetUsed}`,
+    );
+  }
+
   async function buildPreview() {
     setError(null);
     setInfo(null);
@@ -363,6 +398,10 @@ export default function CobrancasPage() {
     }
     if (!isTest && source === "clientes" && !picked.length) {
       setError("Escolha pelo menos 1 cliente.");
+      return;
+    }
+    if (!isTest && source === "planilha" && !sheetGroups?.length) {
+      setError("Envie a planilha da pré-venda (colunas Item, Valor, Cliente e Contato).");
       return;
     }
     if (source === "clientes" && picked.some((p) => !custLines[p.id])) {
@@ -380,6 +419,38 @@ export default function CobrancasPage() {
           (custLines[c.id] || []).filter((l) => !offEvents.has(`${c.id}:${l.event_id}`)),
         );
         built = buildBillingDraft(lines, { mode, includeCharged });
+      } else if (source === "planilha" && sheetGroups?.length) {
+        const fromSheet = buildSheetBillingDraft(sheetGroups, {
+          roundName: sheetUsed || "Pré-venda",
+          eventDate: sheetDate || null,
+          paymentDue: paymentDue || null,
+        });
+        built = { items: fromSheet.items, problems: fromSheet.problems };
+        try {
+          type PhoneCust = Pick<Customer, "id" | "name" | "phone" | "phone_digits" | "created_at">;
+          const customers = await fetchAllQueryRows<PhoneCust>((from, to) =>
+            supabase
+              .from("customers")
+              .select("id, name, phone, phone_digits, created_at")
+              .order("id")
+              .range(from, to) as PromiseLike<{
+              data: PhoneCust[] | null;
+              error: { message: string } | null;
+            }>,
+          );
+          const index = buildPhoneCustomerIndex(customers as Customer[]);
+          for (const it of built.items) {
+            const hit = index.get(it.phone_digits);
+            if (hit) it.customer_id = hit.id;
+          }
+        } catch {
+          /* a lista segue sem vínculo com a ficha */
+        }
+        if (fromSheet.mergedNames) {
+          setInfo(
+            `${fromSheet.mergedNames} telefone(s) tinham mais de um nome na planilha. Ficaram na mesma cobrança.`,
+          );
+        }
       }
       if (isTest) {
         const models = built.items;
@@ -430,14 +501,18 @@ export default function CobrancasPage() {
       const runEventIds =
         source === "eventos"
           ? [...selected]
-          : [...new Set(chosen.flatMap((it) => it.event_ids))];
+          : source === "planilha"
+            ? []
+            : [...new Set(chosen.flatMap((it) => it.event_ids))];
       const evNames =
         source === "eventos"
           ? events
               .filter((e) => selected.has(e.id))
               .map((e) => e.name)
               .join(" + ")
-          : `Por cliente (${new Set(chosen.map((it) => it.phone_digits)).size})`;
+          : source === "planilha"
+            ? sheetUsed || "Planilha"
+            : `Por cliente (${new Set(chosen.map((it) => it.phone_digits)).size})`;
       const runName =
         name.trim() ||
         `${isTest ? "TESTE · " : ""}${evNames || "Cobrança"} · ${new Date().toLocaleDateString("pt-BR")}`;
@@ -552,6 +627,8 @@ export default function CobrancasPage() {
                 />
               </label>
 
+              {source === "planilha" ? null : (
+              <>
               <div className="text-sm">
                 <span className="font-medium text-zinc-700">Formato</span>
                 <div className="mt-1 flex flex-wrap gap-3">
@@ -591,6 +668,8 @@ export default function CobrancasPage() {
                 />
                 Incluir quem já foi marcado como cobrado (lembrete)
               </label>
+              </>
+              )}
 
               <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm">
                 <label className="flex items-center gap-2 font-medium text-amber-900">
@@ -632,6 +711,7 @@ export default function CobrancasPage() {
                   [
                     ["eventos", "Por eventos"],
                     ["clientes", "Por clientes"],
+                    ["planilha", "Por planilha"],
                   ] as const
                 ).map(([key, label]) => (
                   <button
@@ -651,7 +731,82 @@ export default function CobrancasPage() {
                   </button>
                 ))}
               </div>
-              {source === "clientes" ? (
+              {source === "planilha" ? (
+                <div className="text-sm">
+                  <span className="font-medium text-zinc-700">Planilha da pré-venda</span>
+                  <p className="text-xs text-zinc-500">
+                    Aba com as colunas Item, Valor, Cliente e Contato. O valor é o total da linha. Telefone em
+                    branco repete o do mesmo cliente na linha de cima. Quem estiver com Pagamento preenchido fica de
+                    fora. A lista não marca cartas de evento como cobradas.
+                  </p>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    className="mt-2 block w-full text-sm"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) void loadSheet(file).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+                    }}
+                  />
+                  {sheetNames.length > 1 ? (
+                    <label className="mt-2 block text-xs">
+                      <span className="mb-1 block text-zinc-600">Aba</span>
+                      <select
+                        value={sheetUsed}
+                        className="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                        onChange={(e) => {
+                          const file = sheetFile.current;
+                          if (file) {
+                            void loadSheet(file, e.target.value).catch((err) =>
+                              setError(err instanceof Error ? err.message : String(err)),
+                            );
+                          }
+                        }}
+                      >
+                        {sheetNames.map((n) => (
+                          <option key={n} value={n}>
+                            {n}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : sheetUsed ? (
+                    <p className="mt-2 text-xs text-zinc-600">Aba: {sheetUsed}</p>
+                  ) : null}
+                  {sheetGroups ? (
+                    <p className="mt-2 text-xs text-zinc-600">
+                      {sheetGroups.length} cliente(s) · {sheetMeta?.lines ?? 0} item(ns)
+                      {sheetMeta?.paid ? ` · ${sheetMeta.paid} linha(s) já paga(s), de fora` : ""}
+                    </p>
+                  ) : null}
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <label className="block text-xs">
+                      <span className="mb-1 block text-zinc-600">Data da pré-venda</span>
+                      <input
+                        type="date"
+                        value={sheetDate}
+                        onChange={(e) => {
+                          setSheetDate(e.target.value);
+                          setDraft(null);
+                        }}
+                        className="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                    <label className="block text-xs">
+                      <span className="mb-1 block text-zinc-600">Pagamento até</span>
+                      <input
+                        type="date"
+                        value={paymentDue}
+                        onChange={(e) => {
+                          setPaymentDue(e.target.value);
+                          setDraft(null);
+                        }}
+                        className="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                  </div>
+                </div>
+              ) : source === "clientes" ? (
                 <div>
                   <span className="text-sm font-medium text-zinc-700">
                     Clientes ({picked.length} escolhido{picked.length === 1 ? "" : "s"})
@@ -807,7 +962,10 @@ export default function CobrancasPage() {
                 {draft.problems.length ? (
                   <div className="mt-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800">
                     <p className="font-semibold">
-                      Fora da lista ({draft.problems.length}) — corrija no evento e monte de novo:
+                      Fora da lista ({draft.problems.length}) —{" "}
+                      {source === "planilha"
+                        ? "corrija na planilha e monte de novo:"
+                        : "corrija no evento e monte de novo:"}
                     </p>
                     <ul className="mt-1 max-h-40 list-disc overflow-y-auto pl-4">
                       {draft.problems.map((p, i) => (

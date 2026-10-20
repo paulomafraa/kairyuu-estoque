@@ -118,6 +118,58 @@ export function formatMoneyBr(n: number): string {
   });
 }
 
+/** Pré-venda (planilha): o valor já é o total da linha, não o preço unitário. */
+export function buildPrevendaBillingMessage(opts: {
+  customerName: string;
+  roundName: string;
+  eventDate: string | null | undefined;
+  paymentDue: string | null | undefined;
+  lines: Array<{ title: string; total: number | null }>;
+}): { text: string; missingPrice: number; total: number } {
+  let total = 0;
+  let missingPrice = 0;
+  const rows: string[] = [];
+  for (const l of opts.lines) {
+    const title = (l.title || "").trim();
+    if (!title) continue;
+    const price = l.total != null ? Number(l.total) : null;
+    if (price == null || !Number.isFinite(price)) {
+      missingPrice += 1;
+      rows.push(`${title} — R$ ?`);
+    } else {
+      total += price;
+      rows.push(`${title} — R$ ${formatMoneyBr(price)}`);
+    }
+  }
+
+  const dia = formatDiaLongo(opts.eventDate);
+  const when = dia !== "—" ? ` (${dia})` : "";
+  const prazo = (opts.paymentDue || "").trim();
+  const prazoLine = prazo
+    ? `🗓️ Pagamento até: ${formatDiaCurto(prazo)}`
+    : `🗓️ Pagamento: a combinar`;
+
+  const text = [
+    `Olá, ${opts.customerName}! Tudo bem? ☁️💙`,
+    ``,
+    `A Kairyuu TCG agradece pela sua participação na pré-venda! 💕`,
+    ``,
+    `Resumo do seu pedido — ${opts.roundName}${when}:`,
+    ...rows,
+    ``,
+    `Total a pagar: R$ ${formatMoneyBr(total)}`,
+    ``,
+    prazoLine,
+    ``,
+    `O pagamento pode ser por pix ou em 12x por cartão com o juros da maquininha.`,
+    ``,
+    `Sobre a entrega:`,
+    `Nos avise caso queira envio, se não, pode acumular conosco! ✨️`,
+  ].join("\n");
+
+  return { text, missingPrice, total };
+}
+
 export function buildBillingMessage(opts: {
   kind: "leilao" | "encomenda" | string;
   customerName: string;
