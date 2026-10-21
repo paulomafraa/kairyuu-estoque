@@ -484,18 +484,17 @@ export default function ClientesPage() {
         return;
       }
 
-      const { data: existingRows, error: exErr } = await supabase
-        .from("customers")
-        .select("id, name, phone_digits, phone");
-      if (exErr) throw exErr;
+      const existingRows = await fetchAllCustomers(supabase);
 
       const existingByPhone = new Map<string, { id: string; name: string }>();
-      for (const c of existingRows || []) {
+      for (const c of existingRows) {
         const d =
           (c.phone_digits as string) ||
           normalizePhoneDigits((c.phone as string) || "");
-        if (d) {
-          existingByPhone.set(d, { id: c.id as string, name: c.name as string });
+        if (!d) continue;
+        const hit = { id: c.id as string, name: c.name as string };
+        for (const v of phoneVariants(d)) {
+          if (!existingByPhone.has(v)) existingByPhone.set(v, hit);
         }
       }
 
@@ -550,6 +549,9 @@ export default function ClientesPage() {
       let named = 0;
       const chunkSize = 100;
 
+      const isDuplicatePhone = (message: string) =>
+        /duplicate key|unique constraint|phone_digits/i.test(message);
+
       for (let i = 0; i < insertList.length; i += chunkSize) {
         const chunk = insertList.slice(i, i + chunkSize);
         const payload = chunk.map((r) => ({
@@ -561,6 +563,21 @@ export default function ClientesPage() {
         }));
         if (onlyNew) {
           const { error: err } = await supabase.from("customers").insert(payload);
+          if (err && isDuplicatePhone(err.message)) {
+            for (const row of payload) {
+              const one = await supabase.from("customers").insert(row);
+              if (!one.error) {
+                inserted += 1;
+                continue;
+              }
+              if (isDuplicatePhone(one.error.message)) {
+                skipped += 1;
+                continue;
+              }
+              throw one.error;
+            }
+            continue;
+          }
           if (err) throw err;
         } else {
           const { error: err } = await supabase
