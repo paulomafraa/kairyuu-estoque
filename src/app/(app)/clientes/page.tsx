@@ -857,7 +857,9 @@ export default function ClientesPage() {
         <p className="mb-3 text-sm text-zinc-600">
           Baixa atividade no grupo (≤{INACTIVE_MSG_MAX} msgs no sync do bot), do
           menos ativo ao mais ativo. Cadastro no estoque aparece como ficha, mas
-          não tira da lista.
+          não tira da lista. Na retirada (`!inativos` / `!tirar-inativos`), quem
+          está numa lista de cobrança entra com o nome e o telefone da cobrança,
+          mesmo tendo pedido, para liberar vaga no grupo.
           {groupSyncAt
             ? ` Último sync: ${new Date(groupSyncAt).toLocaleString("pt-BR")}.`
             : " Ainda sem sync — rode !inativos loja na auditoria."}

@@ -15,6 +15,7 @@ import {
   type BillingReply,
   type BillingRun,
 } from "@/lib/billing";
+import { applyBillingPaymentToLines } from "@/lib/billing-paid";
 
 type Filter = "all" | "pending" | "sent" | "replied" | "hint" | "failed";
 
@@ -188,6 +189,55 @@ export default function CobrancaDetailPage() {
     const lo = Math.max(30, Math.round(minS));
     const hi = Math.max(lo, Math.round(maxS));
     await patchRun({ min_interval_s: lo, max_interval_s: hi }, `Intervalo: ${lo}–${hi} s.`);
+  }
+
+  async function setPayment(it: BillingItem, confirmed: boolean) {
+    setBusy(true);
+    setError(null);
+    const { data: auth } = await supabase.auth.getUser();
+    const userId = auth.user?.id || null;
+    const now = new Date().toISOString();
+    const { error: err } = await supabase
+      .from("billing_items")
+      .update({
+        payment_status: confirmed ? "confirmed" : "none",
+        payment_confirmed_at: confirmed ? now : null,
+        payment_confirmed_by: confirmed ? userId : null,
+        updated_at: now,
+      })
+      .eq("id", it.id);
+    if (err) {
+      setBusy(false);
+      setError(err.message);
+      return;
+    }
+    const ids = it.sale_line_ids || [];
+    if (ids.length) {
+      try {
+        const synced = await applyBillingPaymentToLines(supabase, ids, confirmed, userId);
+        if (confirmed) {
+          setInfo(
+            `Pago na lista e no evento (${synced.updated} item(ns)). Enviado continua no evento.`,
+          );
+        } else if (synced.blocked) {
+          setInfo(
+            "Marca tirada da lista. No evento, o que já foi enviado continua pago.",
+          );
+        } else {
+          setInfo("Pagamento desfeito na lista e no evento.");
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } else if (confirmed) {
+      setInfo(
+        "Marcado como pago nesta lista. Ao importar num evento de venda, entra pago.",
+      );
+    } else {
+      setInfo("Marca de pagamento tirada desta lista.");
+    }
+    setBusy(false);
+    await load();
   }
 
   async function patchItem(id: string, patch: Partial<BillingItem>, onlyStatus?: BillingItem["status"][]) {
@@ -599,12 +649,7 @@ export default function CobrancaDetailPage() {
                             type="button"
                             disabled={busy}
                             className={btn}
-                            onClick={() =>
-                              void patchItem(it.id, {
-                                payment_status: "confirmed",
-                                payment_confirmed_at: new Date().toISOString(),
-                              })
-                            }
+                            onClick={() => void setPayment(it, true)}
                           >
                             Confirmar pagamento
                           </button>
@@ -614,9 +659,7 @@ export default function CobrancaDetailPage() {
                             type="button"
                             disabled={busy}
                             className={btn}
-                            onClick={() =>
-                              void patchItem(it.id, { payment_status: "none", payment_confirmed_at: null })
-                            }
+                            onClick={() => void setPayment(it, false)}
                           >
                             Limpar marca de pagamento
                           </button>
@@ -624,7 +667,7 @@ export default function CobrancaDetailPage() {
                       </div>
                       {it.payment_status === "confirmed" ? (
                         <p className="mt-2 text-xs text-zinc-500">
-                          Marca só nesta lista. Para dar baixa (pago + caixinha), use a ficha do cliente ou o evento.
+                          Pago aqui também fica pago no evento ligado a esta lista. Enviado continua no evento.
                         </p>
                       ) : null}
                     </div>

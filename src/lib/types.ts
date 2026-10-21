@@ -143,7 +143,7 @@ export type Event = {
   opened_at: string;
   closed_at: string | null;
   payment_due_at?: string | null;
-  kind?: "leilao" | "encomenda" | "outro";
+  kind?: "leilao" | "encomenda" | "venda" | "outro";
   use_stock_box?: boolean;
 };
 

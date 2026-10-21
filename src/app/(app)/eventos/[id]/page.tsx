@@ -21,7 +21,9 @@ import { EventResumoPanel } from "@/components/EventResumoPanel";
 import { FileDropZone } from "@/components/FileDropZone";
 import { createClient } from "@/lib/supabase/client";
 import { eventHappenedAtIso, eventHappenedOn } from "@/lib/event-date";
-import { EVENT_STATUS_LABEL, cardLabel } from "@/lib/labels";
+import { EVENT_STATUS_LABEL, cardLabel, eventKindLabel } from "@/lib/labels";
+import { parseBillingItemLines } from "@/lib/billing-import";
+import { applyBillingPaymentToLines } from "@/lib/billing-paid";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
 import {
   buildPhoneCustomerIndex,
@@ -268,6 +270,10 @@ export default function EventoDetailPage() {
   const markPaidInFlight = useRef(false);
   const [showBox, setShowBox] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [billingRuns, setBillingRuns] = useState<
+    { id: string; name: string; status: string; created_at: string }[]
+  >([]);
+  const [billingRunId, setBillingRunId] = useState("");
   const [includeReview, setIncludeReview] = useState(true);
   const [includeNoVotes, setIncludeNoVotes] = useState(true);
   const [importPreview, setImportPreview] = useState<{
@@ -495,6 +501,26 @@ export default function EventoDetailPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (event?.kind !== "venda") return;
+    let cancelled = false;
+    void supabase
+      .from("billing_runs")
+      .select("id, name, status, created_at")
+      .eq("is_test", false)
+      .order("created_at", { ascending: false })
+      .limit(40)
+      .then(({ data, error: err }) => {
+        if (cancelled || err) return;
+        setBillingRuns(
+          (data || []) as { id: string; name: string; status: string; created_at: string }[],
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [event?.kind, supabase]);
 
   const phoneToCustomer = useMemo(
     () => buildPhoneCustomerIndex(customers),
@@ -1204,6 +1230,182 @@ export default function EventoDetailPage() {
           ? `${msg} — rode supabase/migration_sem_voto.sql no Supabase.`
           : msg,
       );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importBillingList() {
+    if (event?.kind !== "venda") return;
+    if (!billingRunId) {
+      setError("Escolha a lista de cobrança.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const run = billingRuns.find((r) => r.id === billingRunId);
+      const { data, error: err } = await supabase
+        .from("billing_items")
+        .select("id, customer_id, customer_name, phone_digits, text, status, payment_status, sale_line_ids, event_ids")
+        .eq("run_id", billingRunId)
+        .neq("status", "skipped")
+        .order("position");
+      if (err) throw err;
+      const items = (data || []) as Array<{
+        id: string;
+        customer_id: string | null;
+        customer_name: string;
+        phone_digits: string;
+        text: string;
+        status: string;
+        payment_status: string | null;
+        sale_line_ids: string[] | null;
+        event_ids: string[] | null;
+      }>;
+      const existingKeys = new Map(
+        lines.map((l) => [
+          `${(l.phone_digits || "").replace(/\D/g, "")}|${(l.product_title || "").trim().toLowerCase()}|${l.unit_price ?? ""}`,
+          l.id,
+        ]),
+      );
+      let inserted = 0;
+      let already = 0;
+      let paidCount = 0;
+      const problems: string[] = [];
+      const now = new Date().toISOString();
+      for (const item of items) {
+        if (item.sale_line_ids && item.sale_line_ids.length > 0) {
+          already += item.sale_line_ids.length;
+          if (item.payment_status === "confirmed") {
+            const synced = await applyBillingPaymentToLines(
+              supabase,
+              item.sale_line_ids,
+              true,
+              meId,
+            );
+            paidCount += synced.updated;
+          }
+          continue;
+        }
+        const products = parseBillingItemLines(item.text);
+        if (!products.length) {
+          problems.push(`${item.customer_name || item.phone_digits}: mensagem sem itens`);
+          continue;
+        }
+        const phone = normalizePhoneDigits(item.phone_digits || "");
+        let customerId = item.customer_id;
+        if (!customerId && phone) {
+          try {
+            const { customer } = await ensureCustomerByPhone(supabase, {
+              name: item.customer_name || phone,
+              phoneDigits: phone,
+              source: "manual",
+            });
+            customerId = customer.id;
+          } catch {
+            customerId = null;
+          }
+        }
+        const fresh: Record<string, unknown>[] = [];
+        const linked: string[] = [];
+        for (const product of products) {
+          const key = `${phone}|${product.title.toLowerCase()}|${product.unitPrice ?? ""}`;
+          const prev = existingKeys.get(key);
+          if (prev) {
+            linked.push(prev);
+            already += 1;
+            continue;
+          }
+          fresh.push({
+            event_id: eventId,
+            customer_id: customerId,
+            phone_digits: phone,
+            customer_name_snapshot: item.customer_name || phone,
+            product_title: product.title,
+            valor_ou_opcao: "",
+            unit_price: product.unitPrice,
+            qty: product.qty,
+            import_status: "manual",
+            certainty: "certain",
+            arremate: false,
+            poll_id: "",
+            charged: true,
+            charged_at: now,
+            charged_by: meId,
+            paid: false,
+            notes: `Lista de cobrança: ${run?.name || billingRunId}`,
+            created_by: meId,
+          });
+        }
+        if (fresh.length) {
+          const ins = await supabase.from("event_sale_lines").insert(fresh).select("id");
+          if (ins.error) throw ins.error;
+          for (const row of ins.data || []) {
+            linked.push(row.id as string);
+            inserted += 1;
+          }
+          fresh.forEach((row, i) => {
+            const id = (ins.data || [])[i]?.id as string | undefined;
+            if (!id) return;
+            const title = String(row.product_title || "").toLowerCase();
+            const price = row.unit_price ?? "";
+            existingKeys.set(`${phone}|${title}|${price}`, id);
+          });
+        }
+        if (linked.length) {
+          const eventIds = [...new Set([...(item.event_ids || []), eventId])];
+          await supabase
+            .from("billing_items")
+            .update({ sale_line_ids: linked, event_ids: eventIds })
+            .eq("id", item.id);
+          if (item.payment_status === "confirmed") {
+            const synced = await applyBillingPaymentToLines(
+              supabase,
+              linked,
+              true,
+              meId,
+            );
+            paidCount += synced.updated;
+          }
+        }
+      }
+      if (run) {
+        const { data: runRow } = await supabase
+          .from("billing_runs")
+          .select("event_ids")
+          .eq("id", run.id)
+          .maybeSingle();
+        const eventIds = [
+          ...new Set([
+            ...((runRow?.event_ids as string[] | null) || []),
+            eventId,
+          ]),
+        ];
+        await supabase.from("billing_runs").update({ event_ids: eventIds }).eq("id", run.id);
+      }
+      await logStaffAction(supabase, {
+        action: "import_billing_list",
+        detail: `Importou a lista “${run?.name || billingRunId}” neste evento de venda · ${inserted} linha(s) já cobradas`,
+        created_by: meId,
+        entity_type: "event",
+        entity_id: eventId,
+        event_id: eventId,
+      });
+      setInfo(
+        `Lista importada: ${inserted} item(ns) já cobrados` +
+          (paidCount ? ` · ${paidCount} já pagos na lista` : "") +
+          (already ? ` · ${already} já estavam aqui` : "") +
+          (problems.length ? ` · ${problems.length} aviso(s)` : "") +
+          ". Quem não estava pago na lista ainda precisa de pago. Enviado continua na mão.",
+      );
+      if (problems.length) {
+        setError(problems.slice(0, 8).join(" · "));
+      }
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Falha ao importar a lista");
     } finally {
       setBusy(false);
     }
@@ -3235,7 +3437,7 @@ export default function EventoDetailPage() {
             event.name
           )
         }
-        description={`${event.kind || "leilao"} · responsável: ${event.profiles?.name || "—"} · você: ${meName}`}
+        description={`${eventKindLabel(event.kind)} · responsável: ${event.profiles?.name || "—"} · você: ${meName}`}
         actions={
           <div className="flex flex-wrap gap-2">
             {!editingEventName ? (
@@ -3298,7 +3500,7 @@ export default function EventoDetailPage() {
         </div>
         <label className="text-sm">
           <span className="mb-1 block text-zinc-600">
-            Data do evento (dia do leilão/encomenda)
+            Data do evento (dia do leilão, encomenda ou venda)
           </span>
           <input
             className="field"
@@ -3356,6 +3558,52 @@ export default function EventoDetailPage() {
         </div>
       </div>
 
+      {event.kind === "venda" ? (
+        <div className="panel mb-6 space-y-3">
+          <div>
+            <h2 className="text-base font-semibold text-zinc-900">
+              Importar lista de cobrança
+            </h2>
+            <p className="mt-1 text-sm text-zinc-600">
+              Cada pessoa e cada produto da lista entram nesta rodada de venda
+              já como <strong>cobrados</strong>. Quem está pago na lista de
+              cobrança entra <strong>pago</strong> aqui. Enviado continua na mão.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="min-w-[16rem] flex-1 text-sm">
+              <span className="mb-1 block text-zinc-600">Lista</span>
+              <select
+                className="field"
+                value={billingRunId}
+                onChange={(e) => setBillingRunId(e.target.value)}
+              >
+                <option value="">Escolha a lista</option>
+                {billingRuns.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name || "Sem nome"} · {new Date(r.created_at).toLocaleDateString("pt-BR")}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={busy || !billingRunId}
+              onClick={() => void importBillingList()}
+            >
+              {busy ? "Importando…" : "Importar como cobrado"}
+            </button>
+          </div>
+          {!billingRuns.length ? (
+            <p className="text-sm text-zinc-500">
+              Nenhuma lista de cobrança ainda. Crie em Cobranças e volte aqui.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {event.kind === "venda" ? null : (
       <div
         className={`grid gap-4 mb-6 ${event.kind === "encomenda" ? "lg:grid-cols-2" : ""}`}
       >
@@ -3588,6 +3836,7 @@ export default function EventoDetailPage() {
         </div>
       ) : null}
       </div>
+      )}
 
       <EventResumoPanel kind={event.kind || "leilao"} resumo={eventResumo} />
 

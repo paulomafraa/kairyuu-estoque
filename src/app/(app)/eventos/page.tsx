@@ -8,7 +8,7 @@ import { Badge } from "@/components/Badge";
 import { createClient } from "@/lib/supabase/client";
 import { fetchAllQueryRows } from "@/lib/customers";
 import { eventHappenedAtIso, eventHappenedOn } from "@/lib/event-date";
-import { EVENT_STATUS_LABEL } from "@/lib/labels";
+import { EVENT_STATUS_LABEL, eventKindLabel } from "@/lib/labels";
 import { TypeToConfirmDialog } from "@/components/TypeToConfirmDialog";
 import {
   restoreEventRoundBackup,
@@ -37,7 +37,7 @@ export default function EventosPage() {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"leilao" | "encomenda" | "outro">("leilao");
+  const [kind, setKind] = useState<"leilao" | "encomenda" | "venda" | "outro">("leilao");
   const [paymentDue, setPaymentDue] = useState("");
   const [heldOn, setHeldOn] = useState("");
   const [ownerId, setOwnerId] = useState("");
@@ -196,7 +196,11 @@ export default function EventosPage() {
       .select("id")
       .single();
     if (err) {
-      setError(err.message);
+      setError(
+        /events_kind_check|kind_check/i.test(err.message)
+          ? "O tipo Venda ainda não está no banco. Rode supabase/migration_event_kind_venda.sql no Supabase e crie de novo."
+          : err.message,
+      );
       return;
     }
     setName("");
@@ -209,7 +213,7 @@ export default function EventosPage() {
     <div>
       <PageHeader
         title="Eventos"
-        description="Leilão/encomenda: importe a planilha do bot, cobrenças e prazos. Caixa física de estoque é opcional."
+        description="Leilão e encomenda: importe a planilha do bot. Venda: importe uma lista de cobrança. Caixa física de estoque é opcional."
       />
 
       {error ? (
@@ -243,6 +247,7 @@ export default function EventosPage() {
           >
             <option value="leilao">Leilão</option>
             <option value="encomenda">Encomendas</option>
+            <option value="venda">Venda</option>
             <option value="outro">Outro</option>
           </select>
         </label>
@@ -328,7 +333,7 @@ export default function EventosPage() {
                       {EVENT_STATUS_LABEL[ev.status]}
                     </Badge>
                     <span className="ml-2 text-xs text-zinc-500">
-                      {ev.kind || "leilao"}
+                      {eventKindLabel(ev.kind)}
                     </span>
                   </td>
                   <td>

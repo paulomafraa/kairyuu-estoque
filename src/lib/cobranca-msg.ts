@@ -204,8 +204,27 @@ export function buildBillingMessage(opts: {
   const dia = formatDiaLongo(opts.eventDate);
   const prazo = formatDiaCurto(opts.paymentDue);
   const isEnc = opts.kind === "encomenda";
+  const isVenda = opts.kind === "venda";
 
-  const text = isEnc
+  const text = isVenda
+    ? [
+        `Olá, ${opts.customerName}! Tudo bem? ☁️💙`,
+        ``,
+        `A Kairyuu TCG agradece pela sua compra! 💕`,
+        ``,
+        `Resumo do seu pedido do dia ${dia}:`,
+        ...rows,
+        ``,
+        `Total a pagar: R$ ${formatMoneyBr(total)}`,
+        ``,
+        `🗓️ Pagamento até: ${prazo}`,
+        ``,
+        `O pagamento pode ser por pix ou em 12x por cartão com o juros da maquininha.`,
+        ``,
+        `Sobre a entrega:`,
+        `Nos avise caso queira envio, se não, pode acumular conosco! ✨️`,
+      ].join("\n")
+    : isEnc
     ? [
         `Olá, ${opts.customerName}! Tudo bem? ☁️💙`,
         ``,
@@ -299,7 +318,9 @@ export function buildCombinedBillingMessage(opts: {
         ? "Encomenda"
         : ev.kind === "leilao"
           ? "Leilão"
-          : ev.kind || "Evento";
+          : ev.kind === "venda"
+            ? "Venda"
+            : ev.kind || "Evento";
     const dia = formatDiaLongo(ev.eventDate);
     const prazo = formatDiaCurto(ev.paymentDue);
     const header = ev.eventName

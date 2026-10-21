@@ -74,7 +74,13 @@ function statusTone(s: BillingRun["status"]): "neutral" | "good" | "warn" | "bad
 }
 
 function kindLabel(kind?: string | null) {
-  return kind === "leilao" ? "Leilão" : kind === "encomenda" ? "Encomenda" : "Outro";
+  return kind === "leilao"
+    ? "Leilão"
+    : kind === "encomenda"
+      ? "Encomenda"
+      : kind === "venda"
+        ? "Venda"
+        : "Outro";
 }
 
 function fmtDay(iso: string | null | undefined) {

@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { assertBotApiKey, BotAuthError } from "@/lib/bot-auth";
+import { normalizePhoneDigits } from "@/lib/clients-csv";
 import {
+  billingRecipientLookup,
+  fetchBillingRecipients,
   fetchCustomerPhoneSets,
   splitInactivePhones,
 } from "@/lib/customer-activity";
@@ -13,7 +16,8 @@ export const runtime = "nodejs";
  * Body: { phones: string[] }
  * → { inactive, active, purchased }
  * active = cadastrado em customers OU telefone em sale line
- * purchased = qualquer pedido (leilão / encomenda / evento / pedido / item / garagem)
+ * purchased = qualquer pedido, menos quem está numa lista de cobrança
+ * billed / billingNames = nome e telefone dessas cobranças (entram nos inativos)
  */
 export async function POST(req: Request) {
   try {
@@ -28,15 +32,37 @@ export async function POST(req: Request) {
     }
 
     const admin = createAdminClient();
-    const { protected: protectedPhones, purchased: purchasePhones } =
-      await fetchCustomerPhoneSets(admin);
+    const [{ protected: protectedPhones, purchased: purchasePhones }, recipients] =
+      await Promise.all([
+        fetchCustomerPhoneSets(admin),
+        fetchBillingRecipients(admin),
+      ]);
     const { inactive, active } = splitInactivePhones(phones, protectedPhones);
-    const { active: purchased } = splitInactivePhones(phones, purchasePhones);
+    const { active: purchasedAll } = splitInactivePhones(phones, purchasePhones);
+    const byVariant = billingRecipientLookup(recipients);
+    const billed: string[] = [];
+    const billingNames: Record<string, string> = {};
+    const purchased: string[] = [];
+    for (const phone of purchasedAll) {
+      const hit = byVariant.get(normalizePhoneDigits(phone));
+      if (hit) continue;
+      purchased.push(phone);
+    }
+    for (const raw of phones) {
+      const d = normalizePhoneDigits(raw);
+      if (!d) continue;
+      const hit = byVariant.get(d);
+      if (!hit) continue;
+      billed.push(d);
+      if (hit.name) billingNames[d] = hit.name;
+    }
 
     return NextResponse.json({
       inactive,
       active,
       purchased,
+      billed,
+      billingNames,
       checked: inactive.length + active.length,
     });
   } catch (e) {

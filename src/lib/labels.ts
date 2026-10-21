@@ -52,6 +52,14 @@ export const GARAGE_STATUS_LABEL: Record<GarageStatus, string> = {
   cancelled: "Cancelado / estorno",
 };
 
+export function eventKindLabel(kind?: string | null): string {
+  if (kind === "leilao") return "Leilão";
+  if (kind === "encomenda") return "Encomenda";
+  if (kind === "venda") return "Venda";
+  if (kind === "outro") return "Outro";
+  return kind || "Leilão";
+}
+
 export const GARAGE_ORIGIN_LABEL: Record<GarageOrigin, string> = {
   leilao: "Leilão",
   encomenda: "Encomenda",

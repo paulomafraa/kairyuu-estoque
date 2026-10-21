@@ -1,5 +1,11 @@
 import { normalizePhoneDigits } from "@/lib/clients-csv";
-import { buildPhoneLookup, phoneInLookup, phonesMatch } from "@/lib/customers";
+import {
+  buildPhoneLookup,
+  fetchAllQueryRows,
+  phoneInLookup,
+  phoneVariants,
+  phonesMatch,
+} from "@/lib/customers";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 export { phonesMatch };
@@ -129,6 +135,60 @@ export async function fetchActivePurchasePhones(
   supabase: SupabaseClient,
 ): Promise<Set<string>> {
   return fetchProtectedCustomerPhones(supabase);
+}
+
+export type BillingRecipient = { phone: string; name: string };
+
+/**
+ * Nome e telefone de quem está numa lista de cobrança de verdade
+ * (rascunho, enviando ou já enviada). Teste e item pulado ficam de fora.
+ * O mais recente ganha quando a mesma pessoa aparece em mais de uma lista.
+ */
+export async function fetchBillingRecipients(
+  supabase: SupabaseClient,
+): Promise<BillingRecipient[]> {
+  type Row = {
+    id: string;
+    phone_digits: string | null;
+    customer_name: string | null;
+    created_at: string | null;
+  };
+  const rows = await fetchAllQueryRows<Row>((from, to) =>
+    supabase
+      .from("billing_items")
+      .select("id, phone_digits, customer_name, created_at, billing_runs!inner(is_test)")
+      .eq("billing_runs.is_test", false)
+      .neq("status", "skipped")
+      .order("id")
+      .range(from, to),
+  );
+  const best = new Map<string, BillingRecipient & { at: string }>();
+  for (const row of rows) {
+    const phone = normalizePhoneDigits(row.phone_digits || "");
+    if (!phone || phone.length < 10 || phone.length > 15) continue;
+    const name = (row.customer_name || "").trim();
+    const at = row.created_at || "";
+    const prev = best.get(phone);
+    if (!prev || at >= prev.at) {
+      best.set(phone, { phone, name: name || prev?.name || "", at });
+    }
+  }
+  return [...best.values()].map(({ phone, name }) => ({ phone, name }));
+}
+
+/** Telefone da lista de cobrança → nome, cobrindo 55 e o 9 do celular. */
+export function billingRecipientLookup(
+  recipients: BillingRecipient[],
+): Map<string, BillingRecipient> {
+  const byVariant = new Map<string, BillingRecipient>();
+  for (const rec of recipients) {
+    const keys = new Set([rec.phone, ...phoneVariants(rec.phone)]);
+    for (const key of keys) {
+      const prev = byVariant.get(key);
+      if (!prev) byVariant.set(key, rec);
+    }
+  }
+  return byVariant;
 }
 
 export function splitInactivePhones(
