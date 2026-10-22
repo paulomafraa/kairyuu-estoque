@@ -1539,11 +1539,25 @@ export default function ClienteDetailPage() {
     return <p className="text-sm text-zinc-600">Carregando cliente...</p>;
   }
 
+  const siteConta = [
+    customer.site_username
+      ? `@${customer.site_username.replace(/^@/, "")}`
+      : "",
+    customer.site_display_name &&
+    customer.site_display_name.trim() !== customer.name.trim()
+      ? customer.site_display_name.trim()
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
   return (
     <div>
       <PageHeader
         title={editingName ? "Editar nome" : customer.name}
-        description={`WhatsApp: ${customer.phone || "—"} · Você: ${meName}`}
+        description={`WhatsApp: ${customer.phone || "—"} · Você: ${meName}${
+          siteConta ? ` · ${siteConta}` : ""
+        }`}
         actions={
           <div className="flex flex-wrap gap-2">
             {whatsappUrl ? (

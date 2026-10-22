@@ -124,6 +124,11 @@ export type Customer = {
   created_at: string;
   /** Saco/caixa física unificada onde ficam as cartas do cliente (pode ser compartilhada). */
   physical_box_id?: string | null;
+  /** Conta do site, gravada depois que o celular é confirmado por SMS. */
+  site_user_id?: string | null;
+  site_username?: string | null;
+  site_display_name?: string | null;
+  site_linked_at?: string | null;
 };
 
 export type PhysicalBox = {
