@@ -136,8 +136,6 @@ export async function loadRoundItems(
     customer_id: string | null;
     product_title: string;
     qty: number | null;
-    qty_sent: number | null;
-    qty_delivered: number | null;
     paid_at: string | null;
     garage_item_id: string | null;
     customer_name_snapshot: string;
@@ -146,7 +144,7 @@ export async function loadRoundItems(
     supabase
       .from("event_sale_lines")
       .select(
-        "id, customer_id, product_title, qty, qty_sent, qty_delivered, paid_at, garage_item_id, customer_name_snapshot, events(name, kind)",
+        "id, customer_id, product_title, qty, paid_at, garage_item_id, customer_name_snapshot, events(name, kind)",
       )
       .in("customer_id", chunk)
       .eq("paid", true)
@@ -158,12 +156,10 @@ export async function loadRoundItems(
     if (line.garage_item_id && garageIds.has(line.garage_item_id)) continue;
     if (line.garage_item_id) continue;
     const qty = Number(line.qty) > 0 ? Number(line.qty) : 1;
-    const sent = Math.max(Number(line.qty_sent) || 0, Number(line.qty_delivered) || 0);
-    if (sent >= qty) continue;
     items.push({
       key: `l:${line.id}`,
       title: line.product_title,
-      qty: qty - sent,
+      qty,
       source: kindOf(line.events),
       sinceIso: line.paid_at,
       customerId: line.customer_id || undefined,
