@@ -12,7 +12,7 @@ import { fetchAllQueryRows } from "@/lib/customers";
 import { logStaffAction } from "@/lib/audit";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
 import { daysSincePayment, LEILAO_GARAGE_LIMIT_DAYS } from "@/lib/cobranca-msg";
-import { loadBoxHoldings, type BoxHoldings, type StoreItem } from "@/lib/box-holdings";
+import { loadBoxHoldings, loadRoundItems, type BoxHoldings, type StoreItem } from "@/lib/box-holdings";
 import type { PhysicalBox } from "@/lib/types";
 
 type LinkedCustomer = {
@@ -58,6 +58,26 @@ function sourceLabel(source: StoreItem["source"]) {
   return "Rodada";
 }
 
+function WithStoreList({ items }: { items: StoreItem[] }) {
+  if (!items.length) {
+    return <p className="mt-2 text-xs text-zinc-500">Nada pago com a loja agora.</p>;
+  }
+  return (
+    <ul className="mt-2 space-y-0.5 border-t border-zinc-100 pt-2 text-sm text-zinc-800">
+      {items.map((item) => (
+        <li key={item.key}>
+          {item.title}
+          {item.qty > 1 ? ` ×${item.qty}` : ""}
+          <span className="ml-2 text-xs text-zinc-500">
+            {sourceLabel(item.source)}
+            {item.eventName ? ` · ${item.eventName}` : ""}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export default function CaixinhasPage() {
   const supabase = useMemo(() => createClient(), []);
   const [boxes, setBoxes] = useState<PhysicalBox[]>([]);
@@ -91,6 +111,8 @@ export default function CaixinhasPage() {
   const [holdingsBusy, setHoldingsBusy] = useState(false);
   const [lineTitle, setLineTitle] = useState("");
   const [lineQty, setLineQty] = useState("1");
+  const [itemsByCustomer, setItemsByCustomer] = useState<Record<string, StoreItem[]>>({});
+  const [itemsReady, setItemsReady] = useState(false);
 
   const load = useCallback(async () => {
     setError(null);
@@ -117,6 +139,23 @@ export default function CaixinhasPage() {
     const linkedRows = (cu.data || []) as LinkedCustomer[];
     setBoxes((bx.data || []) as PhysicalBox[]);
     setLinked(linkedRows);
+    try {
+      const round = await loadRoundItems(
+        supabase,
+        linkedRows.map((p) => ({ id: p.id, name: p.name, phone: p.phone })),
+      );
+      const byCustomer: Record<string, StoreItem[]> = {};
+      for (const item of round) {
+        if (!item.customerId) continue;
+        const list = byCustomer[item.customerId] || [];
+        list.push(item);
+        byCustomer[item.customerId] = list;
+      }
+      setItemsByCustomer(byCustomer);
+    } catch (e) {
+      setError(boxError(e instanceof Error ? e.message : String(e)));
+    }
+    setItemsReady(true);
 
     const counts: Record<string, number> = {};
     if (linkedRows.length) {
@@ -541,7 +580,7 @@ export default function CaixinhasPage() {
     <div>
       <PageHeader
         title="Estoque físico"
-        description="Os sacos grandes de cada pessoa. O telefone puxa o que está pago e ainda na loja nas rodadas de leilão, encomenda e venda. O que nunca passou por rodada entra como linha manual. Apagar a caixinha não apaga o cliente nem as cartas da rodada."
+        description="Os sacos grandes de cada pessoa. Em quem já está vinculado, a lista abaixo é o que está pago e ainda na loja: leilão, encomenda e venda. O que nunca passou por rodada entra em Contato, como linha manual."
       />
 
       {error ? (
@@ -751,7 +790,7 @@ export default function CaixinhasPage() {
                       className="font-medium text-violet-800 underline"
                       onClick={() => openBox(box)}
                     >
-                      {isOpen ? "Fechar" : "O que está aqui"}
+                      {isOpen ? "Fechar" : "Contato"}
                     </button>
                     {!isRenaming ? (
                       <button
@@ -814,6 +853,12 @@ export default function CaixinhasPage() {
                     </button>
                   )}
                 </div>
+
+                {people.length > 0 && itemsReady ? (
+                  <WithStoreList
+                    items={people.flatMap((p) => itemsByCustomer[p.id] || [])}
+                  />
+                ) : null}
 
                 {isLinking ? (
                   <div className="mt-2 rounded-md border border-zinc-200 bg-zinc-50 p-2">

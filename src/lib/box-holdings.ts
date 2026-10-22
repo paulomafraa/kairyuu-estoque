@@ -12,6 +12,7 @@ export type StoreItem = {
   sinceIso: string | null;
   customerName: string;
   eventName: string;
+  customerId?: string;
   manualId?: string;
 };
 
@@ -56,6 +57,127 @@ export async function customersForBox(
   return [...map.values()];
 }
 
+async function rowsInChunks<T>(
+  ids: string[],
+  run: (
+    chunk: string[],
+    from: number,
+    to: number,
+  ) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const all: T[] = [];
+  for (let i = 0; i < ids.length; i += 80) {
+    const chunk = ids.slice(i, i + 80);
+    for (let from = 0; from < 20000; from += 1000) {
+      const { data, error } = await run(chunk, from, from + 999);
+      if (error) throw new Error(error.message);
+      const batch = data || [];
+      all.push(...batch);
+      if (batch.length < 1000) break;
+    }
+  }
+  return all;
+}
+
+/**
+ * O que está pago e ainda na loja, pelas fichas ligadas.
+ * Não inclui linha manual da caixinha.
+ */
+export async function loadRoundItems(
+  supabase: Db,
+  people: MatchedCustomer[],
+): Promise<StoreItem[]> {
+  const ids = [...new Set(people.map((p) => p.id).filter(Boolean))];
+  if (!ids.length) return [];
+  const nameById = new Map(people.map((p) => [p.id, p.name]));
+  const items: StoreItem[] = [];
+  const garageIds = new Set<string>();
+
+  const garage = await rowsInChunks<{
+    id: string;
+    customer_id: string;
+    title: string;
+    qty_with_store: number;
+    origin: string;
+    event_name: string;
+    created_at: string;
+  }>(ids, (chunk, from, to) =>
+    supabase
+      .from("customer_garage_items")
+      .select(
+        "id, customer_id, title, qty_with_store, origin, event_name, created_at, status, event_sale_line_id",
+      )
+      .in("customer_id", chunk)
+      .gt("qty_with_store", 0)
+      .in("status", ["in_garage", "reserved"])
+      .order("id", { ascending: true })
+      .range(from, to),
+  );
+  for (const g of garage) {
+    garageIds.add(g.id);
+    const source: StoreItem["source"] =
+      g.origin === "leilao" || g.origin === "encomenda" || g.origin === "venda"
+        ? g.origin
+        : "outro";
+    items.push({
+      key: `g:${g.id}`,
+      title: g.title,
+      qty: Number(g.qty_with_store) || 1,
+      source,
+      sinceIso: g.created_at,
+      customerId: g.customer_id,
+      customerName: nameById.get(g.customer_id) || "",
+      eventName: g.event_name || "",
+    });
+  }
+
+  const lines = await rowsInChunks<{
+    id: string;
+    customer_id: string | null;
+    product_title: string;
+    qty: number | null;
+    qty_sent: number | null;
+    qty_delivered: number | null;
+    paid_at: string | null;
+    garage_item_id: string | null;
+    customer_name_snapshot: string;
+    events: unknown;
+  }>(ids, (chunk, from, to) =>
+    supabase
+      .from("event_sale_lines")
+      .select(
+        "id, customer_id, product_title, qty, qty_sent, qty_delivered, paid_at, garage_item_id, customer_name_snapshot, events(name, kind)",
+      )
+      .in("customer_id", chunk)
+      .eq("paid", true)
+      .eq("cancelled", false)
+      .order("id", { ascending: true })
+      .range(from, to),
+  );
+  for (const line of lines) {
+    if (line.garage_item_id && garageIds.has(line.garage_item_id)) continue;
+    if (line.garage_item_id) continue;
+    const qty = Number(line.qty) > 0 ? Number(line.qty) : 1;
+    const sent = Math.max(Number(line.qty_sent) || 0, Number(line.qty_delivered) || 0);
+    if (sent >= qty) continue;
+    items.push({
+      key: `l:${line.id}`,
+      title: line.product_title,
+      qty: qty - sent,
+      source: kindOf(line.events),
+      sinceIso: line.paid_at,
+      customerId: line.customer_id || undefined,
+      customerName:
+        (line.customer_id && nameById.get(line.customer_id)) ||
+        line.customer_name_snapshot ||
+        "",
+      eventName: eventNameOf(line.events),
+    });
+  }
+
+  return items;
+}
+
 /**
  * O que está conosco: garagem ainda na loja + linha paga da rodada que
  * ainda não virou envio. Linha manual é o que não passou por rodada.
@@ -66,86 +188,7 @@ export async function loadBoxHoldings(
   linked: MatchedCustomer[],
 ): Promise<BoxHoldings> {
   const people = await customersForBox(supabase, box, linked);
-  const ids = people.map((p) => p.id);
-  const nameById = new Map(people.map((p) => [p.id, p.name]));
-  const items: StoreItem[] = [];
-  const garageIds = new Set<string>();
-
-  if (ids.length) {
-    const { data: garage, error: gErr } = await supabase
-      .from("customer_garage_items")
-      .select(
-        "id, customer_id, title, qty_with_store, origin, event_name, created_at, status, event_sale_line_id",
-      )
-      .in("customer_id", ids)
-      .gt("qty_with_store", 0)
-      .in("status", ["in_garage", "reserved"]);
-    if (gErr) throw new Error(gErr.message);
-    for (const g of (garage || []) as Array<{
-      id: string;
-      customer_id: string;
-      title: string;
-      qty_with_store: number;
-      origin: string;
-      event_name: string;
-      created_at: string;
-    }>) {
-      garageIds.add(g.id);
-      const source: StoreItem["source"] =
-        g.origin === "leilao" || g.origin === "encomenda" || g.origin === "venda"
-          ? g.origin
-          : "outro";
-      items.push({
-        key: `g:${g.id}`,
-        title: g.title,
-        qty: Number(g.qty_with_store) || 1,
-        source,
-        sinceIso: g.created_at,
-        customerName: nameById.get(g.customer_id) || "",
-        eventName: g.event_name || "",
-      });
-    }
-
-    const { data: lines, error: lErr } = await supabase
-      .from("event_sale_lines")
-      .select(
-        "id, customer_id, product_title, qty, qty_sent, qty_delivered, paid_at, garage_item_id, customer_name_snapshot, events(name, kind)",
-      )
-      .in("customer_id", ids)
-      .eq("paid", true)
-      .eq("cancelled", false);
-    if (lErr) throw new Error(lErr.message);
-    for (const line of (lines || []) as Array<{
-      id: string;
-      customer_id: string | null;
-      product_title: string;
-      qty: number | null;
-      qty_sent: number | null;
-      qty_delivered: number | null;
-      paid_at: string | null;
-      garage_item_id: string | null;
-      customer_name_snapshot: string;
-      events: unknown;
-    }>) {
-      if (line.garage_item_id && garageIds.has(line.garage_item_id)) continue;
-      if (line.garage_item_id) continue;
-      const qty = Number(line.qty) > 0 ? Number(line.qty) : 1;
-      const sent = Math.max(Number(line.qty_sent) || 0, Number(line.qty_delivered) || 0);
-      if (sent >= qty) continue;
-      items.push({
-        key: `l:${line.id}`,
-        title: line.product_title,
-        qty: qty - sent,
-        source: kindOf(line.events),
-        sinceIso: line.paid_at,
-        customerName:
-          (line.customer_id && nameById.get(line.customer_id)) ||
-          line.customer_name_snapshot ||
-          "",
-        eventName: eventNameOf(line.events),
-      });
-    }
-  }
+  const items = await loadRoundItems(supabase, people);
 
   let manualError: string | null = null;
   const { data: manual, error: mErr } = await supabase
