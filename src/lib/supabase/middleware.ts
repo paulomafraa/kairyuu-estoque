@@ -42,7 +42,9 @@ export async function updateSession(request: NextRequest) {
   const isHome = path === "/";
   // APIs com auth própria (chave do bot / fluxo de signup)
   const isOpenApi =
-    path.startsWith("/api/bot/") || path.startsWith("/api/auth/");
+    path.startsWith("/api/bot/") ||
+    path.startsWith("/api/auth/") ||
+    path.startsWith("/api/cron/");
   const isPublic = isLogin || isOpenApi;
 
   if (!user && !isPublic) {

@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/box-reminders",
+      "schedule": "0 13 * * *"
+    }
+  ]
+}

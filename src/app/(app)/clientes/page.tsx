@@ -57,7 +57,7 @@ type SilentGroupMember = {
 /** Limiar alinhado ao default do !inativos loja (≤5 msgs). */
 const INACTIVE_MSG_MAX = 5;
 /** Evita montar milhares de <tr> a cada tecla da busca. */
-const LIST_RENDER_LIMIT = 80;
+const PAGE_SIZE = 40;
 /** Só filtra a lista depois que a digitação para. Enter aplica na hora. */
 const SEARCH_IDLE_MS = 1000;
 
@@ -148,6 +148,7 @@ export default function ClientesPage() {
   const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [boxLabelById, setBoxLabelById] = useState<Record<string, string>>({});
+  const [listPage, setListPage] = useState(1);
 
   const load = useCallback(async () => {
     setError(null);
@@ -380,7 +381,7 @@ export default function ClientesPage() {
           if (worstRank[next] < worstRank[prev.worst]) prev.worst = next;
         }
         if (urgency === "overdue") {
-          bump(id, "leilão: prazo 2 meses estourado");
+          bump(id, "leilão: prazo 3 meses estourado");
         } else if (urgency === "warn") {
           bump(id, "leilão: perto do prazo de envio");
         }
@@ -699,7 +700,13 @@ export default function ClientesPage() {
     };
   }, [customers, silentUnregistered]);
 
-  const shown = filtered.slice(0, LIST_RENDER_LIMIT);
+  useEffect(() => {
+    setListPage(1);
+  }, [filter, search]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage = Math.min(listPage, pageCount);
+  const shown = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
     <div>
@@ -847,7 +854,7 @@ export default function ClientesPage() {
             ["pendencias", `Pendências (${counts.pendencias})`],
             [
               "prazo_leilao",
-              `Leilão · prazo 2 meses (${counts.prazo_leilao})`,
+              `Leilão · prazo 3 meses (${counts.prazo_leilao})`,
             ],
             [
               "inativos_grupo",
@@ -884,11 +891,32 @@ export default function ClientesPage() {
       ) : null}
 
       <CustomerSearchField applied={search} onSearch={setSearch} />
-      {filtered.length > LIST_RENDER_LIMIT ? (
-        <p className="mb-3 text-sm text-zinc-600">
-          Mostrando {LIST_RENDER_LIMIT} de {filtered.length}. Digite mais no
-          campo de busca para achar o restante.
-        </p>
+      {filtered.length > 0 ? (
+        <div className="mb-3 flex flex-wrap items-center gap-2 text-sm text-zinc-600">
+          {filtered.length > PAGE_SIZE ? (
+            <button
+              type="button"
+              className="btn-secondary px-2 py-1 text-xs"
+              disabled={safePage <= 1}
+              onClick={() => setListPage(safePage - 1)}
+            >
+              Anterior
+            </button>
+          ) : null}
+          <span>
+            Página {safePage} de {pageCount} · {filtered.length} clientes
+          </span>
+          {filtered.length > PAGE_SIZE ? (
+            <button
+              type="button"
+              className="btn-secondary px-2 py-1 text-xs"
+              disabled={safePage >= pageCount}
+              onClick={() => setListPage(safePage + 1)}
+            >
+              Próxima
+            </button>
+          ) : null}
+        </div>
       ) : null}
 
       {filtered.length === 0 &&
@@ -995,6 +1023,30 @@ export default function ClientesPage() {
               ))}
             </tbody>
           </table>
+        </div>
+      ) : null}
+
+      {filtered.length > PAGE_SIZE ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-zinc-600">
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage <= 1}
+            onClick={() => setListPage(safePage - 1)}
+          >
+            Anterior
+          </button>
+          <span>
+            Página {safePage} de {pageCount}
+          </span>
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage >= pageCount}
+            onClick={() => setListPage(safePage + 1)}
+          >
+            Próxima
+          </button>
         </div>
       ) : null}
 

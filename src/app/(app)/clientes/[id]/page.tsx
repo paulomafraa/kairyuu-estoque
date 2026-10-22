@@ -1694,7 +1694,7 @@ export default function ClienteDetailPage() {
             }`}
           >
             <h3 className="text-sm font-semibold text-zinc-900">
-              Aviso · leilão na caixinha (prazo de 2 meses)
+              Aviso · leilão na caixinha (prazo de 3 meses)
             </h3>
             <p className="mt-1 text-xs text-zinc-600">
               Cartas de leilão ficam conosco por até {LEILAO_GARAGE_LIMIT_DAYS}{" "}
@@ -2087,10 +2087,10 @@ export default function ClienteDetailPage() {
               </button>
             ) : null}
             <Link
-              href="/caixinhas"
+              href="/estoque"
               className="text-xs font-medium text-sky-800 underline"
             >
-              Ver todas as caixinhas
+              Ver o estoque físico
             </Link>
           </div>
         ) : (
@@ -2112,10 +2112,10 @@ export default function ClienteDetailPage() {
               </span>
             ) : null}
             <Link
-              href="/caixinhas"
+              href="/estoque"
               className="text-xs font-medium text-sky-800 underline"
             >
-              Ver todas as caixinhas
+              Ver o estoque físico
             </Link>
             <button
               type="button"

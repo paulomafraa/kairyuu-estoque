@@ -3,12 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-const links = [
-  { href: "/estoque", label: "Estoque" },
+const links: { href: string; label: string; also?: string[] }[] = [
+  { href: "/estoque", label: "Estoque físico", also: ["/caixinhas"] },
   { href: "/eventos", label: "Eventos" },
   { href: "/envios", label: "Envios" },
   { href: "/clientes", label: "Clientes" },
-  { href: "/caixinhas", label: "Caixinhas" },
   { href: "/cobrancas", label: "Cobranças" },
   { href: "/encomendas", label: "Encomendas" },
   { href: "/auditoria", label: "Auditoria" },
@@ -32,7 +31,11 @@ export function AppNav({ userName }: { userName?: string }) {
         <nav className="flex flex-wrap gap-1">
           {links.map((link) => {
             const isActive =
-              pathname === link.href || pathname.startsWith(`${link.href}/`);
+              pathname === link.href ||
+              pathname.startsWith(`${link.href}/`) ||
+              (link.also || []).some(
+                (href) => pathname === href || pathname.startsWith(`${href}/`),
+              );
             return (
               <Link
                 key={link.href}

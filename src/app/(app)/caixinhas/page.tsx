@@ -6,9 +6,13 @@ import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
 import { ConfirmButton } from "@/components/ConfirmButton";
+import { TypeToConfirmDialog } from "@/components/TypeToConfirmDialog";
 import { createClient } from "@/lib/supabase/client";
 import { fetchAllQueryRows } from "@/lib/customers";
 import { logStaffAction } from "@/lib/audit";
+import { normalizePhoneDigits } from "@/lib/clients-csv";
+import { daysSincePayment, LEILAO_GARAGE_LIMIT_DAYS } from "@/lib/cobranca-msg";
+import { loadBoxHoldings, type BoxHoldings, type StoreItem } from "@/lib/box-holdings";
 import type { PhysicalBox } from "@/lib/types";
 
 type LinkedCustomer = {
@@ -20,6 +24,8 @@ type LinkedCustomer = {
 
 type Filter = "todas" | "com_cliente" | "sem_cliente";
 
+const PAGE_SIZE = 40;
+
 function foldText(s: string) {
   return s
     .normalize("NFD")
@@ -28,6 +34,13 @@ function foldText(s: string) {
 }
 
 function boxError(message: string) {
+  if (
+    /physical_box_lines|physical_box_reminders|reminders_enabled|'phone'|'email'/i.test(
+      message,
+    )
+  ) {
+    return `${message} — rode supabase/migration_physical_stock.sql no Supabase.`;
+  }
   if (/physical_box/i.test(message)) {
     return `${message} — rode supabase/migration_physical_boxes.sql no Supabase.`;
   }
@@ -35,6 +48,14 @@ function boxError(message: string) {
     return "Já existe uma caixinha com esse nome.";
   }
   return message;
+}
+
+function sourceLabel(source: StoreItem["source"]) {
+  if (source === "leilao") return "Leilão";
+  if (source === "encomenda") return "Encomenda";
+  if (source === "venda") return "Venda";
+  if (source === "manual") return "Anotado aqui";
+  return "Rodada";
 }
 
 export default function CaixinhasPage() {
@@ -51,12 +72,25 @@ export default function CaixinhasPage() {
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<Filter>("todas");
+  const [page, setPage] = useState(1);
   const [newLabel, setNewLabel] = useState("");
+  const [newPhone, setNewPhone] = useState("");
+  const [newEmail, setNewEmail] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [linkingId, setLinkingId] = useState<string | null>(null);
   const [linkQuery, setLinkQuery] = useState("");
   const [linkResults, setLinkResults] = useState<LinkedCustomer[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [draftPhone, setDraftPhone] = useState("");
+  const [draftEmail, setDraftEmail] = useState("");
+  const [draftReminders, setDraftReminders] = useState(false);
+  const [holdings, setHoldings] = useState<BoxHoldings | null>(null);
+  const [holdingsBusy, setHoldingsBusy] = useState(false);
+  const [lineTitle, setLineTitle] = useState("");
+  const [lineQty, setLineQty] = useState("1");
 
   const load = useCallback(async () => {
     setError(null);
@@ -107,6 +141,10 @@ export default function CaixinhasPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, filter]);
 
   useEffect(() => {
     const q = linkQuery.trim();
@@ -161,15 +199,28 @@ export default function CaixinhasPage() {
 
   const visible = useMemo(() => {
     const q = foldText(search.trim());
+    const digits = search.replace(/\D/g, "");
     return boxes.filter((b) => {
       const people = customersByBox.get(b.id) || [];
       if (filter === "com_cliente" && people.length === 0) return false;
       if (filter === "sem_cliente" && people.length > 0) return false;
-      if (!q) return true;
+      if (!q && !digits) return true;
       if (foldText(b.label).includes(q)) return true;
-      return people.some((p) => foldText(p.name).includes(q));
+      if (q && foldText(b.email || "").includes(q)) return true;
+      if (digits && (b.phone_digits || "").includes(digits)) return true;
+      return people.some(
+        (p) =>
+          foldText(p.name).includes(q) ||
+          (digits.length >= 4 && p.phone.replace(/\D/g, "").includes(digits)),
+      );
     });
   }, [boxes, customersByBox, filter, search]);
+
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount);
+  const pageRows = visible.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pageIds = pageRows.map((b) => b.id);
+  const allOnPage = pageIds.length > 0 && pageIds.every((id) => selected.has(id));
 
   async function audit(action: string, detail: string, customerId?: string) {
     await logStaffAction(supabase, {
@@ -192,11 +243,17 @@ export default function CaixinhasPage() {
   async function createBox() {
     const label = newLabel.trim();
     if (!label) return;
+    const phone = newPhone.trim();
+    const email = newEmail.trim();
     setBusy(true);
     setError(null);
-    const { error: err } = await supabase
-      .from("physical_boxes")
-      .insert({ label, created_by: meId });
+    const row: Record<string, string | null> = { label, created_by: meId };
+    if (phone) {
+      row.phone = phone;
+      row.phone_digits = normalizePhoneDigits(phone);
+    }
+    if (email) row.email = email;
+    const { error: err } = await supabase.from("physical_boxes").insert(row);
     setBusy(false);
     if (err) {
       setError(boxError(err.message));
@@ -204,6 +261,8 @@ export default function CaixinhasPage() {
     }
     await audit("physical_box_create", `Caixinha física criada · ${label}`);
     setNewLabel("");
+    setNewPhone("");
+    setNewEmail("");
     setInfo(`Caixinha "${label}" criada.`);
     await load();
   }
@@ -253,7 +312,36 @@ export default function CaixinhasPage() {
         people.length ? ` · clientes desvinculados: ${people.map((p) => p.name).join(", ")}` : ""
       }`,
     );
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.delete(box.id);
+      return next;
+    });
+    if (openId === box.id) setOpenId(null);
     setInfo(`Caixinha "${box.label}" excluída.`);
+    await load();
+  }
+
+  async function deleteSelected() {
+    const ids = [...selected];
+    if (!ids.length) return;
+    setBusy(true);
+    setError(null);
+    const labels = boxes.filter((b) => selected.has(b.id)).map((b) => b.label);
+    const { error: err } = await supabase.from("physical_boxes").delete().in("id", ids);
+    setBusy(false);
+    if (err) {
+      setError(boxError(err.message));
+      return;
+    }
+    await audit(
+      "physical_box_delete",
+      `Caixinhas físicas excluídas (${ids.length}) · ${labels.join(", ")}`,
+    );
+    setSelected(new Set());
+    setBulkOpen(false);
+    if (openId && ids.includes(openId)) setOpenId(null);
+    setInfo(`${ids.length} caixinha(s) excluída(s). Clientes e cartas das rodadas continuam no cadastro.`);
     await load();
   }
 
@@ -283,6 +371,7 @@ export default function CaixinhasPage() {
     setLinkResults([]);
     setLinkingId(null);
     await load();
+    if (openId === box.id) await refreshHoldings(box);
   }
 
   async function unlinkCustomer(box: PhysicalBox, customer: LinkedCustomer) {
@@ -306,11 +395,153 @@ export default function CaixinhasPage() {
     await load();
   }
 
+  async function refreshHoldings(box: PhysicalBox) {
+    setHoldingsBusy(true);
+    try {
+      const { data: peopleRows } = await supabase
+        .from("customers")
+        .select("id, name, phone")
+        .eq("physical_box_id", box.id);
+      const people = ((peopleRows || []) as { id: string; name: string; phone: string }[]).map(
+        (p) => ({ id: p.id, name: p.name, phone: p.phone }),
+      );
+      const result = await loadBoxHoldings(supabase, box, people);
+      setHoldings(result);
+      if (result.manualError) setError(boxError(result.manualError));
+    } catch (e) {
+      setHoldings(null);
+      setError(boxError(e instanceof Error ? e.message : String(e)));
+    } finally {
+      setHoldingsBusy(false);
+    }
+  }
+
+  function openBox(box: PhysicalBox) {
+    if (openId === box.id) {
+      setOpenId(null);
+      setHoldings(null);
+      return;
+    }
+    setOpenId(box.id);
+    setDraftPhone(box.phone || "");
+    setDraftEmail(box.email || "");
+    setDraftReminders(Boolean(box.reminders_enabled));
+    setLineTitle("");
+    setLineQty("1");
+    setHoldings(null);
+    void refreshHoldings(box);
+  }
+
+  async function saveContact(box: PhysicalBox) {
+    const email = draftEmail.trim();
+    const phone = draftPhone.trim();
+    if (draftReminders && !email.includes("@")) {
+      setError("Para ligar os avisos, salve um e-mail nesta caixinha.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("physical_boxes")
+      .update({
+        phone,
+        phone_digits: normalizePhoneDigits(phone),
+        email,
+        reminders_enabled: Boolean(draftReminders && email.includes("@")),
+      })
+      .eq("id", box.id);
+    setBusy(false);
+    if (err) {
+      setError(boxError(err.message));
+      return;
+    }
+    await audit(
+      "physical_box_contact",
+      `Contato da caixinha · ${box.label}${phone ? ` · ${phone}` : ""}${email ? ` · ${email}` : ""}`,
+    );
+    setInfo(`Contato de "${box.label}" salvo.`);
+    await load();
+    await refreshHoldings({
+      ...box,
+      phone,
+      phone_digits: normalizePhoneDigits(phone),
+      email,
+    });
+  }
+
+  async function addLine(box: PhysicalBox) {
+    const title = lineTitle.trim();
+    const qty = Math.max(1, Math.floor(Number(lineQty) || 1));
+    if (!title) return;
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase.from("physical_box_lines").insert({
+      box_id: box.id,
+      title,
+      qty,
+      created_by: meId,
+    });
+    setBusy(false);
+    if (err) {
+      setError(boxError(err.message));
+      return;
+    }
+    setLineTitle("");
+    setLineQty("1");
+    setInfo(`"${title}" anotado na caixinha "${box.label}".`);
+    await refreshHoldings(box);
+  }
+
+  async function removeLine(box: PhysicalBox, item: StoreItem) {
+    if (!item.manualId) return;
+    setBusy(true);
+    setError(null);
+    const { error: err } = await supabase
+      .from("physical_box_lines")
+      .delete()
+      .eq("id", item.manualId);
+    setBusy(false);
+    if (err) {
+      setError(boxError(err.message));
+      return;
+    }
+    await refreshHoldings(box);
+  }
+
+  function toggleSelected(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function togglePage() {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allOnPage) {
+        for (const id of pageIds) next.delete(id);
+      } else {
+        for (const id of pageIds) next.add(id);
+      }
+      return next;
+    });
+  }
+
+  const openBoxRow = boxes.find((b) => b.id === openId) || null;
+  const linkedIds = new Set(
+    (openBoxRow ? customersByBox.get(openBoxRow.id) || [] : []).map((p) => p.id),
+  );
+  const phoneMatches = (holdings?.matchedCustomers || []).filter(
+    (c) => !linkedIds.has(c.id),
+  );
+
   return (
     <div>
       <PageHeader
-        title="Caixinhas físicas"
-        description="Os sacos grandes onde juntamos os envelopes de cada pessoa. A caixinha existe por conta própria: vincule um ou mais clientes quando quiser (ex.: casal na mesma caixinha). As cartas são colocadas na caixa pela ficha do cliente ou pelo evento."
+        title="Estoque físico"
+        description="Os sacos grandes de cada pessoa. O telefone puxa o que está pago e ainda na loja nas rodadas de leilão, encomenda e venda. O que nunca passou por rodada entra como linha manual. Apagar a caixinha não apaga o cliente nem as cartas da rodada."
       />
 
       {error ? (
@@ -337,6 +568,24 @@ export default function CaixinhasPage() {
             }}
           />
         </label>
+        <label className="min-w-[10rem] text-sm">
+          <span className="mb-1 block text-zinc-600">Telefone (recomendado)</span>
+          <input
+            className="field"
+            placeholder="Com DDD"
+            value={newPhone}
+            onChange={(e) => setNewPhone(e.target.value)}
+          />
+        </label>
+        <label className="min-w-[12rem] flex-1 text-sm">
+          <span className="mb-1 block text-zinc-600">E-mail (recomendado)</span>
+          <input
+            className="field"
+            placeholder="para o aviso de prazo"
+            value={newEmail}
+            onChange={(e) => setNewEmail(e.target.value)}
+          />
+        </label>
         <button
           type="button"
           className="btn-primary"
@@ -350,7 +599,7 @@ export default function CaixinhasPage() {
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <input
           className="field max-w-xs"
-          placeholder="Buscar caixinha ou cliente…"
+          placeholder="Buscar nome, telefone ou e-mail…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -374,7 +623,50 @@ export default function CaixinhasPage() {
             {label}
           </button>
         ))}
+        {selected.size > 0 ? (
+          <button
+            type="button"
+            className="rounded-md border border-red-300 bg-red-50 px-3 py-1.5 text-sm font-medium text-red-800"
+            disabled={busy}
+            onClick={() => setBulkOpen(true)}
+          >
+            Apagar selecionadas ({selected.size})
+          </button>
+        ) : null}
       </div>
+
+      {visible.length > PAGE_SIZE ? (
+        <div className="mb-3 flex flex-wrap items-center gap-2 text-sm text-zinc-600">
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage <= 1}
+            onClick={() => setPage(safePage - 1)}
+          >
+            Anterior
+          </button>
+          <span>
+            Página {safePage} de {pageCount} · {visible.length} caixinhas
+          </span>
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage >= pageCount}
+            onClick={() => setPage(safePage + 1)}
+          >
+            Próxima
+          </button>
+          <label className="ml-2 inline-flex items-center gap-1 text-xs">
+            <input type="checkbox" checked={allOnPage} onChange={togglePage} />
+            Marcar esta página
+          </label>
+        </div>
+      ) : visible.length > 0 ? (
+        <label className="mb-3 inline-flex items-center gap-1 text-xs text-zinc-600">
+          <input type="checkbox" checked={allOnPage} onChange={togglePage} />
+          Marcar todas ({visible.length})
+        </label>
+      ) : null}
 
       {!loaded ? (
         <p className="text-sm text-zinc-500">Carregando…</p>
@@ -385,7 +677,7 @@ export default function CaixinhasPage() {
         />
       ) : (
         <ul className="flex flex-col gap-2">
-          {visible.map((box) => {
+          {pageRows.map((box) => {
             const people = customersByBox.get(box.id) || [];
             const inBox = people.reduce(
               (sum, p) => sum + (boxedCountByCustomer[p.id] || 0),
@@ -393,49 +685,74 @@ export default function CaixinhasPage() {
             );
             const isRenaming = renamingId === box.id;
             const isLinking = linkingId === box.id;
+            const isOpen = openId === box.id;
             return (
               <li
                 key={box.id}
                 className="rounded-md border border-zinc-200 bg-white px-3 py-2"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  {isRenaming ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <input
-                        className="field"
-                        value={renameValue}
-                        autoFocus
-                        onChange={(e) => setRenameValue(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") void renameBox(box);
-                          if (e.key === "Escape") setRenamingId(null);
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="btn-primary px-2 py-1 text-xs"
-                        disabled={busy}
-                        onClick={() => void renameBox(box)}
-                      >
-                        Salvar
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-secondary px-2 py-1 text-xs"
-                        onClick={() => setRenamingId(null)}
-                      >
-                        Cancelar
-                      </button>
-                    </div>
-                  ) : (
-                    <span className="font-medium text-zinc-900">{box.label}</span>
-                  )}
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(box.id)}
+                      onChange={() => toggleSelected(box.id)}
+                      aria-label={`Selecionar ${box.label}`}
+                    />
+                    {isRenaming ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          className="field"
+                          value={renameValue}
+                          autoFocus
+                          onChange={(e) => setRenameValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") void renameBox(box);
+                            if (e.key === "Escape") setRenamingId(null);
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="btn-primary px-2 py-1 text-xs"
+                          disabled={busy}
+                          onClick={() => void renameBox(box)}
+                        >
+                          Salvar
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary px-2 py-1 text-xs"
+                          onClick={() => setRenamingId(null)}
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="font-medium text-zinc-900">{box.label}</span>
+                    )}
+                    {box.phone ? (
+                      <span className="text-xs text-zinc-500">{box.phone}</span>
+                    ) : null}
+                    {box.email ? (
+                      <span className="text-xs text-zinc-500">{box.email}</span>
+                    ) : null}
+                  </div>
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     {people.length > 0 ? (
                       <Badge tone="neutral">{inBox} carta(s) na caixa</Badge>
                     ) : (
                       <Badge tone="warn">sem cliente vinculado</Badge>
                     )}
+                    {box.reminders_enabled ? (
+                      <Badge tone="good">avisos ligados</Badge>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="font-medium text-violet-800 underline"
+                      onClick={() => openBox(box)}
+                    >
+                      {isOpen ? "Fechar" : "O que está aqui"}
+                    </button>
                     {!isRenaming ? (
                       <button
                         type="button"
@@ -559,11 +876,199 @@ export default function CaixinhasPage() {
                     ) : null}
                   </div>
                 ) : null}
+
+                {isOpen ? (
+                  <div className="mt-3 rounded-md border border-zinc-200 bg-zinc-50 p-3">
+                    <div className="flex flex-wrap items-end gap-2">
+                      <label className="min-w-[10rem] text-sm">
+                        <span className="mb-1 block text-zinc-600">Telefone</span>
+                        <input
+                          className="field"
+                          value={draftPhone}
+                          onChange={(e) => setDraftPhone(e.target.value)}
+                        />
+                      </label>
+                      <label className="min-w-[14rem] flex-1 text-sm">
+                        <span className="mb-1 block text-zinc-600">E-mail</span>
+                        <input
+                          className="field"
+                          value={draftEmail}
+                          onChange={(e) => setDraftEmail(e.target.value)}
+                        />
+                      </label>
+                      <label className="flex items-center gap-2 pb-2 text-sm text-zinc-700">
+                        <input
+                          type="checkbox"
+                          checked={draftReminders}
+                          disabled={!draftEmail.includes("@")}
+                          onChange={(e) => setDraftReminders(e.target.checked)}
+                        />
+                        Avisos de prazo
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-primary px-2 py-1 text-xs"
+                        disabled={busy}
+                        onClick={() => void saveContact(box)}
+                      >
+                        Salvar contato
+                      </button>
+                    </div>
+                    <p className="mt-2 text-xs text-zinc-500">
+                      Os avisos começam desligados. São 3 e-mails de leilão: 2 semanas,
+                      1 semana e 1 dia antes dos 3 meses. Sem e-mail o aviso não liga.
+                      Encomenda continua no prazo de chegada (60 a 90 dias), separado deste.
+                    </p>
+
+                    {phoneMatches.length > 0 ? (
+                      <ul className="mt-2 space-y-1 text-sm">
+                        {phoneMatches.map((c) => (
+                          <li key={c.id} className="flex flex-wrap items-center gap-2">
+                            <span>
+                              O telefone também é a ficha de {c.name}
+                              {c.phone ? ` · ${c.phone}` : ""}
+                            </span>
+                            <button
+                              type="button"
+                              className="text-xs font-medium text-violet-800 underline"
+                              disabled={busy}
+                              onClick={() =>
+                                void linkCustomer(box, {
+                                  id: c.id,
+                                  name: c.name,
+                                  phone: c.phone,
+                                  physical_box_id: null,
+                                })
+                              }
+                            >
+                              Vincular
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+
+                    <h3 className="mt-3 text-sm font-semibold text-zinc-900">
+                      Com a loja agora
+                    </h3>
+                    {holdingsBusy ? (
+                      <p className="mt-1 text-sm text-zinc-500">Carregando…</p>
+                    ) : !holdings || holdings.items.length === 0 ? (
+                      <p className="mt-1 text-sm text-zinc-500">
+                        Nada pago e ainda na loja por este telefone, e nenhuma linha manual.
+                      </p>
+                    ) : (
+                      <ul className="mt-2 space-y-1 text-sm">
+                        {holdings.items.map((item) => {
+                          const held =
+                            item.source === "leilao" ? daysSincePayment(item.sinceIso) : null;
+                          const left =
+                            held == null ? null : LEILAO_GARAGE_LIMIT_DAYS - held;
+                          return (
+                            <li
+                              key={item.key}
+                              className="flex flex-wrap items-center justify-between gap-2"
+                            >
+                              <span>
+                                {item.title}
+                                {item.qty > 1 ? ` ×${item.qty}` : ""}
+                                <span className="ml-2 text-xs text-zinc-500">
+                                  {sourceLabel(item.source)}
+                                  {item.eventName ? ` · ${item.eventName}` : ""}
+                                  {item.customerName ? ` · ${item.customerName}` : ""}
+                                  {left != null
+                                    ? left < 0
+                                      ? ` · prazo estourado`
+                                      : ` · faltam ${left} dia(s)`
+                                    : ""}
+                                </span>
+                              </span>
+                              {item.manualId ? (
+                                <button
+                                  type="button"
+                                  className="text-xs text-red-700 underline"
+                                  disabled={busy}
+                                  onClick={() => void removeLine(box, item)}
+                                >
+                                  Tirar
+                                </button>
+                              ) : null}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+
+                    <div className="mt-3 flex flex-wrap items-end gap-2">
+                      <label className="min-w-[14rem] flex-1 text-sm">
+                        <span className="mb-1 block text-zinc-600">
+                          Linha que não veio de rodada
+                        </span>
+                        <input
+                          className="field"
+                          placeholder="Carta ou produto"
+                          value={lineTitle}
+                          onChange={(e) => setLineTitle(e.target.value)}
+                        />
+                      </label>
+                      <label className="w-20 text-sm">
+                        <span className="mb-1 block text-zinc-600">Qtd</span>
+                        <input
+                          className="field"
+                          value={lineQty}
+                          onChange={(e) => setLineQty(e.target.value)}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-secondary px-2 py-1 text-xs"
+                        disabled={busy || !lineTitle.trim()}
+                        onClick={() => void addLine(box)}
+                      >
+                        Anotar
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </li>
             );
           })}
         </ul>
       )}
+
+      {visible.length > PAGE_SIZE ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-zinc-600">
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage <= 1}
+            onClick={() => setPage(safePage - 1)}
+          >
+            Anterior
+          </button>
+          <span>
+            Página {safePage} de {pageCount}
+          </span>
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={safePage >= pageCount}
+            onClick={() => setPage(safePage + 1)}
+          >
+            Próxima
+          </button>
+        </div>
+      ) : null}
+
+      <TypeToConfirmDialog
+        open={bulkOpen}
+        title={`Apagar ${selected.size} caixinha(s)`}
+        warning="Isso tira as caixinhas da lista e desvincula os clientes. Não apaga a ficha do cliente nem as cartas das rodadas."
+        busy={busy}
+        error={null}
+        onCancel={() => setBulkOpen(false)}
+        onConfirm={() => deleteSelected()}
+      />
     </div>
   );
 }

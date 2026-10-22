@@ -79,7 +79,7 @@ function isLeilaoRow(row: OwedRow): boolean {
   return row.events?.kind === "leilao" || row.origin === "leilao";
 }
 
-/** Janela ~2 meses: evento ou pagamento recente, ou já no prazo de alerta. */
+/** Janela de 3 meses: evento ou pagamento recente, ou já no prazo de alerta. */
 function inLeilaoShipWindow(row: OwedRow, daysHeld: number | null): boolean {
   if (daysHeld != null && daysHeld >= 50) return true;
   const eventIso =
@@ -270,7 +270,7 @@ export default function EnviosPage() {
     <div>
       <PageHeader
         title="A enviar"
-        description="Itens pagos que ainda estão com a loja. Leilão tem prazo de até 2 meses a partir do pagamento; encomendas ficam em lista separada no fluxo geral."
+        description="Itens pagos que ainda estão com a loja. Leilão tem prazo de até 3 meses a partir do pagamento; encomendas ficam em lista separada no fluxo geral."
       />
 
       {error ? (
@@ -284,7 +284,7 @@ export default function EnviosPage() {
         <Badge tone="neutral">{groups.length} evento(s)</Badge>
         {leilaoUrgentCount > 0 ? (
           <Badge tone="bad">
-            {leilaoUrgentCount} leilão perto/passou 2 meses
+            {leilaoUrgentCount} leilão perto/passou 3 meses
           </Badge>
         ) : null}
         <button type="button" className="btn-secondary" onClick={() => void load()}>
@@ -305,7 +305,7 @@ export default function EnviosPage() {
                   </h2>
                   <p className="text-sm text-zinc-600">
                     Cartas de leilão ficam conosco por até{" "}
-                    <strong>{LEILAO_GARAGE_LIMIT_DAYS} dias (~2 meses)</strong>{" "}
+                    <strong>{LEILAO_GARAGE_LIMIT_DAYS} dias (3 meses)</strong>{" "}
                     a partir do pagamento. Amarelo a partir de{" "}
                     {LEILAO_GARAGE_WARN_DAYS} dias; vermelho no limite.
                   </p>
@@ -383,9 +383,9 @@ export default function EnviosPage() {
                             </div>
                             <div className="mt-0.5 text-xs text-zinc-500">
                               {item.urgency === "overdue"
-                                ? `Conosco desde ${deadline.sinceLabel} · passou o limite de 2 meses (${item.daysHeld}d)`
+                                ? `Conosco desde ${deadline.sinceLabel} · passou o limite de 3 meses (${item.daysHeld}d)`
                                 : item.urgency === "warn"
-                                  ? `Conosco desde ${deadline.sinceLabel} · faltam ${Math.max(0, deadline.daysLeft)}d para o limite de 2 meses`
+                                  ? `Conosco desde ${deadline.sinceLabel} · faltam ${Math.max(0, deadline.daysLeft)}d para o limite de 3 meses`
                                   : `Conosco desde ${deadline.sinceLabel} · ${item.daysHeld}d · faltam ${Math.max(0, deadline.daysLeft)}d`}
                             </div>
                           </div>

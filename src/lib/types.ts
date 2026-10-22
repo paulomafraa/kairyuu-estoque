@@ -132,6 +132,11 @@ export type PhysicalBox = {
   notes: string;
   created_at: string;
   created_by: string | null;
+  phone?: string;
+  phone_digits?: string;
+  email?: string;
+  /** Aviso por e-mail do prazo de 3 meses. Começa desligado. */
+  reminders_enabled?: boolean;
 };
 
 export type Event = {

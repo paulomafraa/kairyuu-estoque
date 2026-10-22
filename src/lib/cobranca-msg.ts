@@ -259,7 +259,7 @@ export function buildBillingMessage(opts: {
         `O pagamento pode ser por pix ou em 12x por cartão com o juros da maquininha.`,
         ``,
         `Sobre a entrega:`,
-        `Nos avise caso queira envio, se não, pode acumular conosco junto de outros leilões por até 2 meses ✨️`,
+        `Nos avise caso queira envio, se não, pode acumular conosco junto de outros leilões por até 3 meses ✨️`,
       ].join("\n");
 
   return { text, missingPrice, total };
@@ -340,7 +340,7 @@ export function buildCombinedBillingMessage(opts: {
   const entrega: string[] = ["Sobre a entrega:"];
   if (hasLeilao) {
     entrega.push(
-      "• Leilão: nos avise caso queira envio; se não, pode acumular conosco junto de outros leilões por até 2 meses ✨️",
+      "• Leilão: nos avise caso queira envio; se não, pode acumular conosco junto de outros leilões por até 3 meses ✨️",
     );
   }
   if (hasEncomenda) {
@@ -388,12 +388,12 @@ export function daysSincePayment(
   return Math.round((a.getTime() - d.getTime()) / 86_400_000);
 }
 
-/** Limite de acumulação na loja para cartas de leilão (≈ 2 meses). */
-export const LEILAO_GARAGE_LIMIT_DAYS = 60;
-/** Aviso amarelo: faltam ~10 dias pro limite. */
-export const LEILAO_GARAGE_WARN_DAYS = 50;
+/** Limite de acumulação na loja para cartas de leilão (3 meses). */
+export const LEILAO_GARAGE_LIMIT_DAYS = 90;
+/** Aviso amarelo: faltam 14 dias (primeiro e-mail de prazo). */
+export const LEILAO_GARAGE_WARN_DAYS = 76;
 
-/** Alerta de prazo de garagem do leilão (2 meses ≈ 60 dias). */
+/** Alerta de prazo de garagem do leilão (3 meses). */
 export function leilaoGarageUrgency(
   daysHeld: number | null,
 ): "ok" | "warn" | "overdue" | "none" {
@@ -424,14 +424,14 @@ export function formatLeilaoGarageDeadline(opts: {
     const late = Math.max(0, opts.daysHeld - LEILAO_GARAGE_LIMIT_DAYS);
     shortLabel =
       late > 0
-        ? `Prazo estourado · ${late}d além dos 2 meses`
-        : "Prazo de 2 meses estourado";
-    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Já passou o limite de 2 meses (${opts.daysHeld} dia(s) na loja) — pedir envio.`;
+        ? `Prazo estourado · ${late}d além dos 3 meses`
+        : "Prazo de 3 meses estourado";
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Já passou o limite de 3 meses (${opts.daysHeld} dia(s) na loja) — pedir envio.`;
   } else if (urgency === "warn") {
     shortLabel = `Perto do prazo · faltam ${Math.max(0, daysLeft)}d`;
-    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 2 meses — avisar o cliente para pedir envio.`;
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel}. Faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 3 meses — avisar o cliente para pedir envio.`;
   } else {
-    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel} · ${opts.daysHeld} dia(s) · faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 2 meses.`;
+    detailLabel = `Tem cartas de leilão conosco desde ${sinceLabel} · ${opts.daysHeld} dia(s) · faltam ${Math.max(0, daysLeft)} dia(s) para o limite de 3 meses.`;
   }
 
   return { urgency, sinceLabel, daysLeft, shortLabel, detailLabel };
