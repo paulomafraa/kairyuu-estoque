@@ -198,6 +198,123 @@ async function holdingsFor(
   }));
 }
 
+type RoundLine = {
+  event_id: string;
+  product_title: string | null;
+  qty: number | null;
+  qty_arrived: number | null;
+  cancelled: boolean | null;
+  events?: { id: string; name: string; kind: string; opened_at: string } | { id: string; name: string; kind: string; opened_at: string }[] | null;
+};
+
+function eventOf(line: RoundLine) {
+  const raw = line.events;
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+/** Uma etapa só para a rodada inteira, a partir do que a central já marcou. */
+function etapaDaRodada(
+  lines: RoundLine[],
+  stock: { product_title: string | null; qty_arrived: number | null; pedido_feito: boolean | null }[],
+): "japao" | "voo" | "brasil" {
+  const byTitle = new Map<string, { ordered: number; lineArrived: number }>();
+  for (const line of lines) {
+    if (line.cancelled) continue;
+    const title = line.product_title || "";
+    const cur = byTitle.get(title) || { ordered: 0, lineArrived: 0 };
+    const qty = Number(line.qty) || 0;
+    cur.ordered += qty;
+    cur.lineArrived += Math.min(qty, Number(line.qty_arrived) || 0);
+    byTitle.set(title, cur);
+  }
+  if (!byTitle.size) return "japao";
+
+  let faltaPedir = 0;
+  let faltaChegar = 0;
+  for (const [title, agg] of byTitle) {
+    const st = stock.find((s) => (s.product_title || "") === title);
+    if (!st?.pedido_feito) faltaPedir += 1;
+    let arrived = agg.lineArrived;
+    if (arrived === 0) arrived = Math.min(agg.ordered, Number(st?.qty_arrived) || 0);
+    if (arrived < agg.ordered) faltaChegar += 1;
+  }
+  if (faltaPedir > 0) return "japao";
+  if (faltaChegar > 0) return "voo";
+  return "brasil";
+}
+
+async function rodadasDaConta(
+  admin: ReturnType<typeof createAdminClient>,
+  phone: string,
+) {
+  const people = await customersByPhone(admin, phone);
+  const ids = people.map((p) => p.id);
+  const variants = phoneVariants(phone);
+  const select =
+    "event_id, product_title, qty, qty_arrived, cancelled, events!inner(id, name, kind, opened_at)";
+
+  const mine: RoundLine[] = [];
+  if (ids.length) {
+    const { data, error } = await admin
+      .from("event_sale_lines")
+      .select(select)
+      .in("customer_id", ids)
+      .eq("cancelled", false)
+      .limit(400);
+    if (error) throw new Error(error.message);
+    mine.push(...((data || []) as RoundLine[]));
+  }
+  if (variants.length) {
+    const { data, error } = await admin
+      .from("event_sale_lines")
+      .select(select)
+      .in("phone_digits", variants)
+      .eq("cancelled", false)
+      .limit(400);
+    if (error) throw new Error(error.message);
+    mine.push(...((data || []) as RoundLine[]));
+  }
+
+  const events = new Map<string, { name: string; opened_at: string }>();
+  for (const line of mine) {
+    const ev = eventOf(line);
+    if (!ev || ev.kind !== "encomenda") continue;
+    events.set(ev.id, { name: ev.name, opened_at: ev.opened_at || "" });
+  }
+  const eventIds = [...events.keys()];
+  if (!eventIds.length) return [];
+
+  const { data: allLines, error: linesErr } = await admin
+    .from("event_sale_lines")
+    .select("event_id, product_title, qty, qty_arrived, cancelled")
+    .in("event_id", eventIds)
+    .eq("cancelled", false);
+  if (linesErr) throw new Error(linesErr.message);
+
+  const { data: stock, error: stockErr } = await admin
+    .from("event_product_stock")
+    .select("event_id, product_title, qty_arrived, pedido_feito")
+    .in("event_id", eventIds);
+  if (stockErr) throw new Error(stockErr.message);
+
+  return eventIds
+    .map((id) => {
+      const ev = events.get(id)!;
+      const lines = ((allLines || []) as RoundLine[]).filter((l) => l.event_id === id);
+      const products = (stock || []).filter((s) => s.event_id === id);
+      return {
+        id,
+        nome: ev.name,
+        etapa: etapaDaRodada(lines, products),
+        origem: "japao",
+        openedAt: ev.opened_at,
+      };
+    })
+    .sort((a, b) => b.openedAt.localeCompare(a.openedAt))
+    .slice(0, 12)
+    .map(({ openedAt: _opened, ...round }) => round);
+}
+
 function readProfile(body: ProfileBody) {
   const phone = canonicalPhone(body.phone || "");
   const siteUserId = clip(body.siteUserId, 40);
@@ -250,6 +367,11 @@ export async function GET(req: Request) {
     }
 
     const admin = createAdminClient();
+    if (url.searchParams.get("view") === "viagem") {
+      const rounds = await rodadasDaConta(admin, phone);
+      return NextResponse.json({ rounds });
+    }
+
     const people = await customersByPhone(admin, phone);
     const items = people.length ? await holdingsFor(admin, people) : [];
     const main = pickCustomer(people, phone);
