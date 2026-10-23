@@ -7,6 +7,7 @@ import {
   type BillingLine,
 } from "@/lib/cobranca-msg";
 import { normalizePhoneDigits } from "@/lib/clients-csv";
+import { phonesMatch } from "@/lib/customers";
 import { eventHappenedOn } from "@/lib/event-date";
 import {
   isActiveBillableSaleLine,
@@ -199,10 +200,14 @@ export function buildBillingDraft(
 
   for (const line of lines) {
     if (!isBillableOpenLine(line, opts.includeCharged)) continue;
-    const phone = normalizePhoneDigits(
-      line.phone_digits || line.customers?.phone || "",
-    );
-    const name = (line.customers?.name || line.customer_name_snapshot || "").trim();
+    const linePhone = normalizePhoneDigits(line.phone_digits || "");
+    const fichaPhone = normalizePhoneDigits(line.customers?.phone || "");
+    const fichaConflicts =
+      Boolean(linePhone) && Boolean(fichaPhone) && !phonesMatch(linePhone, fichaPhone);
+    const phone = linePhone || (fichaConflicts ? "" : fichaPhone);
+    const snapshot = (line.customer_name_snapshot || "").trim();
+    const fichaName = (fichaConflicts ? "" : line.customers?.name || "").trim();
+    const name = fichaName || snapshot;
     if (!phone || phone.length < 10) {
       problems.push({
         name: name || "(sem nome)",
@@ -215,13 +220,13 @@ export function buildBillingDraft(
     if (!c) {
       c = {
         phone,
-        customerId: line.customer_id,
+        customerId: fichaConflicts ? null : line.customer_id,
         name,
         byEvent: new Map(),
       };
       clients.set(phone, c);
     }
-    if (!c.customerId && line.customer_id) c.customerId = line.customer_id;
+    if (!fichaConflicts && !c.customerId && line.customer_id) c.customerId = line.customer_id;
     if ((!c.name || looksLikePhoneName(c.name)) && name) c.name = name;
     const evId = line.event_id;
     const list = c.byEvent.get(evId) || [];

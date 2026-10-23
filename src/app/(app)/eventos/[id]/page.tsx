@@ -3608,7 +3608,7 @@ export default function EventoDetailPage() {
         className={`grid gap-4 mb-6 ${event.kind === "encomenda" ? "lg:grid-cols-2" : ""}`}
       >
       <div
-        className={`panel space-y-3 ${importDragging ? "ring-2 ring-zinc-900 ring-offset-2" : ""}`}
+        className={`panel space-y-3 ${importDragging ? "ring-2 ring-emerald-400 ring-offset-2" : ""}`}
         onDragEnter={(e) => {
           e.preventDefault();
           if ([...e.dataTransfer.types].includes("Files")) setImportDragging(true);
@@ -3668,28 +3668,29 @@ export default function EventoDetailPage() {
           )}
         </div>
 
+        <FileDropZone
+          className="mt-3"
+          accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+          disabled={busy}
+          title="Solte a planilha aqui"
+          hint={
+            event.kind === "encomenda"
+              ? "Clique em Escolher arquivo ou arraste o resultado do bot (.xlsx) ou o CSV de custos."
+              : "Clique em Escolher arquivo ou arraste o Resultado do bot (.xlsx / .xls / .csv)."
+          }
+          onFile={async (f) => {
+            const name = f.name.toLowerCase();
+            if (event.kind === "encomenda" && name.endsWith(".csv")) {
+              await uploadEncomendaTemplate(f);
+              return;
+            }
+            setShowImport(true);
+            await onPickFile(f);
+          }}
+        />
+
         {showImport || importDragging ? (
-          <div className="space-y-3">
-            <FileDropZone
-              accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
-              disabled={busy}
-              title={
-                importDragging ? "Solte pra importar" : "Solte a planilha aqui"
-              }
-              hint={
-                event.kind === "encomenda"
-                  ? "Resultado do bot (.xlsx) ou template de custos (.csv)."
-                  : "Arquivo Resultado do bot (.xlsx / .xls / .csv)."
-              }
-              onFile={async (f) => {
-                const name = f.name.toLowerCase();
-                if (event.kind === "encomenda" && name.endsWith(".csv")) {
-                  await uploadEncomendaTemplate(f);
-                  return;
-                }
-                await onPickFile(f);
-              }}
-            />
+          <div className="mt-3 space-y-3">
             <p className="text-sm text-zinc-600">
               {event.kind === "encomenda" ? (
                 <>
@@ -3799,12 +3800,7 @@ export default function EventoDetailPage() {
               </div>
             ) : null}
           </div>
-        ) : (
-          <p className="text-sm text-zinc-500">
-            Dica: dá pra arrastar o arquivo direto em cima deste bloco, sem
-            abrir nada.
-          </p>
-        )}
+        ) : null}
       </div>
 
       {event.kind === "encomenda" ? (
@@ -3823,7 +3819,7 @@ export default function EventoDetailPage() {
             accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
             disabled={busy}
             title="Solte o encomendas.xlsx aqui"
-            hint="Abas tipo Encomendas - 2608. Também aceita o CSV antigo (Carta / ValorJP / venda)."
+            hint="Clique em Escolher arquivo ou arraste a planilha. Abas tipo Encomendas - 2608. Também aceita o CSV antigo."
             onFile={async (f) => {
               await uploadEncomendaTemplate(f);
             }}

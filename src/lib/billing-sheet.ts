@@ -1,14 +1,24 @@
 /**
  * Lista de cobrança a partir de uma aba de pré-venda.
  * Colunas: Item, Valor (total da linha), Cliente, Contato, Pagamento (opcional).
- * Telefone em branco na linha seguinte do mesmo cliente repete o de cima.
+ * Telefone em branco só repete o de cima quando o nome também está em branco
+ * (continuação do mesmo bloco). Se o nome vem escrito de novo e o contato
+ * está vazio, o telefone copiado só vale quando esse nome existe em no máximo
+ * uma ficha. Dois clientes com o mesmo nome exigem o telefone na linha.
  */
 
 import { looksLikePhoneName, type BillingDraftItem, type BillingDraftProblem } from "./billing";
 import { buildPrevendaBillingMessage, greetingName } from "./cobranca-msg";
 import { parseMoneyCell } from "./encomenda-template";
 
-export type SheetBillingLine = { title: string; total: number | null };
+export type SheetBillingLine = {
+  title: string;
+  total: number | null;
+  /** Contato vazio; o telefone foi o da linha anterior com o mesmo nome. */
+  phoneCopiedByName?: boolean;
+};
+
+export type SheetNameRef = { name: string };
 
 export type SheetBillingGroup = {
   name: string;
@@ -130,19 +140,29 @@ export function parseBillingMatrix(matrix: unknown[][], sheetName: string): Omit
 
   let lastName = "";
   let lastPhone = "";
+  let lastCopied = false;
   const { cols } = header;
 
   for (let r = header.row + 1; r < matrix.length; r++) {
     const row = matrix[r] || [];
-    let name = cellText(row[cols.cliente]).replace(/\s+/g, " ").trim();
-    let phoneRaw = cellText(row[cols.contato]);
+    const nameCell = cellText(row[cols.cliente]).replace(/\s+/g, " ").trim();
+    const phoneCell = cellText(row[cols.contato]);
+    let name = nameCell;
+    let phoneRaw = phoneCell;
+    let copiedByName = false;
+    if (!nameCell && !phoneCell) {
+      name = lastName;
+      phoneRaw = lastPhone;
+      copiedByName = lastCopied;
+    } else if (!phoneCell && nameCell && lastPhone && loose(nameCell) === loose(lastName)) {
+      phoneRaw = lastPhone;
+      copiedByName = true;
+    }
     const title = cellText(row[cols.item]).replace(/\s+/g, " ").trim();
-    const samePerson = !name || loose(name) === loose(lastName);
-    if (!phoneRaw && samePerson) phoneRaw = lastPhone;
-    if (!name) name = lastName;
     if (!title && !name && !phoneRaw) continue;
     if (name) lastName = name;
-    if (cellText(row[cols.contato])) lastPhone = cellText(row[cols.contato]);
+    if (phoneCell) lastPhone = phoneCell;
+    lastCopied = copiedByName;
     if (cols.pagamento >= 0 && isPaid(row[cols.pagamento])) {
       if (title) paidSkipped += 1;
       continue;
@@ -158,7 +178,11 @@ export function parseBillingMatrix(matrix: unknown[][], sheetName: string): Omit
     } else if (name && loose(name) !== loose(g.name) && !g.extraNames.some((n) => loose(n) === loose(name))) {
       g.extraNames.push(name);
     }
-    g.lines.push({ title, total: moneyCell(row[cols.valor]) });
+    g.lines.push({
+      title,
+      total: moneyCell(row[cols.valor]),
+      phoneCopiedByName: copiedByName || undefined,
+    });
   }
 
   return {
@@ -205,32 +229,60 @@ export async function parseBillingXlsxFile(file: File, sheetName?: string): Prom
   return parseBillingXlsxBuffer(await file.arrayBuffer(), sheetName);
 }
 
+function nameCounts(customers: SheetNameRef[] | null | undefined): Map<string, number> | null {
+  if (!customers?.length) return null;
+  const map = new Map<string, number>();
+  for (const c of customers) {
+    const key = loose(c.name || "");
+    if (!key) continue;
+    map.set(key, (map.get(key) || 0) + 1);
+  }
+  return map;
+}
+
 export function buildSheetBillingDraft(
   groups: SheetBillingGroup[],
   opts: { roundName: string; eventDate: string | null; paymentDue: string | null },
+  customers?: SheetNameRef[] | null,
 ): { items: BillingDraftItem[]; problems: BillingDraftProblem[]; mergedNames: number } {
   const items: BillingDraftItem[] = [];
   const problems: BillingDraftProblem[] = [];
   let mergedNames = 0;
+  const knownNames = nameCounts(customers);
 
   for (const g of groups) {
+    const copied = g.lines.filter((l) => l.phoneCopiedByName);
+    const sameName = knownNames?.get(loose(g.name)) || 0;
+    const ambiguous = copied.length > 0 && (knownNames == null || sameName > 1);
+    const lines = ambiguous ? g.lines.filter((l) => !l.phoneCopiedByName) : g.lines;
+    if (copied.length && ambiguous) {
+      problems.push({
+        name: g.name,
+        phone: "",
+        reason:
+          sameName > 1
+            ? `Há ${sameName} clientes com esse nome e ${copied.length} item(ns) sem telefone na planilha. Coloque o contato para não cobrar a pessoa errada`
+            : `${copied.length} item(ns) sem telefone na planilha. O nome sozinho não define o contato`,
+      });
+    }
+    if (!lines.length) continue;
     const { phone, problem } = sheetPhoneDigits(g.phoneRaw);
     if (!phone) {
       problems.push({
         name: g.name,
         phone: g.phoneRaw,
-        reason: `${problem} · ${g.lines.length} item(ns)`,
+        reason: `${problem} · ${lines.length} item(ns)`,
       });
       continue;
     }
-    const missing = g.lines.filter((l) => l.total == null || !Number.isFinite(Number(l.total))).length;
+    const missing = lines.filter((l) => l.total == null || !Number.isFinite(Number(l.total))).length;
     const greeting = greetingName(g.name, phone, looksLikePhoneName);
     const { text, total, missingPrice } = buildPrevendaBillingMessage({
       customerName: greeting,
       roundName: opts.roundName || "Pré-venda",
       eventDate: opts.eventDate,
       paymentDue: opts.paymentDue,
-      lines: g.lines,
+      lines,
     });
     if (missingPrice > 0 || missing > 0) {
       problems.push({

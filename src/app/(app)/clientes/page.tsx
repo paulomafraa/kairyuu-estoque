@@ -788,37 +788,18 @@ export default function ClientesPage() {
           </button>
         </form>
       ) : (
-        <div
-          className="panel mb-6"
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={async (e) => {
-            e.preventDefault();
-            const file = e.dataTransfer.files?.[0];
-            if (!file) return;
-            setShowImport(true);
+        <FileDropZone
+          className="mb-6"
+          accept=".csv,text/csv,text/plain"
+          disabled={busy}
+          title="Importar CSV de clientes"
+          hint="Clique em Escolher arquivo ou arraste o CSV do bot (!exportar-clientes)."
+          onFile={async (file) => {
             setCsvText(await file.text());
+            setShowImport(true);
             setInfo(`Arquivo carregado: ${file.name}`);
           }}
-        >
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold text-zinc-900">
-                Importar CSV de clientes
-              </div>
-              <p className="mt-0.5 text-sm text-zinc-600">
-                Arraste o arquivo pra cá ou use o botão{" "}
-                <strong>Importar CSV WhatsApp</strong>.
-              </p>
-            </div>
-            <button
-              type="button"
-              className="btn-primary"
-              onClick={() => setShowImport(true)}
-            >
-              Abrir importação
-            </button>
-          </div>
-        </div>
+        />
       )}
 
       <form onSubmit={onCreate} className="panel mb-6 grid gap-3 sm:grid-cols-3">

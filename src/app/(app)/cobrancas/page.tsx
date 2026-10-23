@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FileDropZone } from "@/components/FileDropZone";
 import { PageHeader } from "@/components/PageHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Badge } from "@/components/Badge";
@@ -28,6 +29,7 @@ import {
   fetchCustomersSharingPhone,
   fetchSaleLinesForCustomer,
   phoneInLookup,
+  phonesMatch,
 } from "@/lib/customers";
 import {
   buildSheetBillingDraft,
@@ -426,15 +428,10 @@ export default function CobrancasPage() {
         );
         built = buildBillingDraft(lines, { mode, includeCharged });
       } else if (source === "planilha" && sheetGroups?.length) {
-        const fromSheet = buildSheetBillingDraft(sheetGroups, {
-          roundName: sheetUsed || "Pré-venda",
-          eventDate: sheetDate || null,
-          paymentDue: paymentDue || null,
-        });
-        built = { items: fromSheet.items, problems: fromSheet.problems };
+        type PhoneCust = Pick<Customer, "id" | "name" | "phone" | "phone_digits" | "created_at">;
+        let customers: PhoneCust[] | null = null;
         try {
-          type PhoneCust = Pick<Customer, "id" | "name" | "phone" | "phone_digits" | "created_at">;
-          const customers = await fetchAllQueryRows<PhoneCust>((from, to) =>
+          customers = await fetchAllQueryRows<PhoneCust>((from, to) =>
             supabase
               .from("customers")
               .select("id, name, phone, phone_digits, created_at")
@@ -444,13 +441,27 @@ export default function CobrancasPage() {
               error: { message: string } | null;
             }>,
           );
+        } catch {
+          customers = null;
+        }
+        const fromSheet = buildSheetBillingDraft(
+          sheetGroups,
+          {
+            roundName: sheetUsed || "Pré-venda",
+            eventDate: sheetDate || null,
+            paymentDue: paymentDue || null,
+          },
+          customers,
+        );
+        built = { items: fromSheet.items, problems: fromSheet.problems };
+        if (customers?.length) {
           const index = buildPhoneCustomerIndex(customers as Customer[]);
           for (const it of built.items) {
             const hit = index.get(it.phone_digits);
-            if (hit) it.customer_id = hit.id;
+            if (hit && phonesMatch(hit.phone_digits || hit.phone || "", it.phone_digits)) {
+              it.customer_id = hit.id;
+            }
           }
-        } catch {
-          /* a lista segue sem vínculo com a ficha */
         }
         if (fromSheet.mergedNames) {
           setInfo(
@@ -741,18 +752,21 @@ export default function CobrancasPage() {
                 <div className="text-sm">
                   <span className="font-medium text-zinc-700">Planilha da pré-venda</span>
                   <p className="text-xs text-zinc-500">
-                    Aba com as colunas Item, Valor, Cliente e Contato. O valor é o total da linha. Telefone em
-                    branco repete o do mesmo cliente na linha de cima. Quem estiver com Pagamento preenchido fica de
-                    fora. A lista não marca cartas de evento como cobradas.
+                    Aba com as colunas Item, Valor, Cliente e Contato. O valor é o total da linha. Se o nome se
+                    repete e o contato está vazio, e existem duas fichas com esse nome, a linha fica de fora. Quem
+                    estiver com Pagamento preenchido fica de fora. A lista não marca cartas de evento como cobradas.
                   </p>
-                  <input
-                    type="file"
-                    accept=".xlsx,.xls"
-                    className="mt-2 block w-full text-sm"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) void loadSheet(file).catch((err) => setError(err instanceof Error ? err.message : String(err)));
-                    }}
+                  <FileDropZone
+                    className="mt-2"
+                    accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                    disabled={busy}
+                    title="Solte a planilha da pré-venda"
+                    hint="Clique em Escolher arquivo ou arraste o .xlsx para esta caixa."
+                    onFile={(file) =>
+                      loadSheet(file).catch((err) =>
+                        setError(err instanceof Error ? err.message : String(err)),
+                      )
+                    }
                   />
                   {sheetNames.length > 1 ? (
                     <label className="mt-2 block text-xs">
