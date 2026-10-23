@@ -128,6 +128,7 @@ export type Customer = {
   site_user_id?: string | null;
   site_username?: string | null;
   site_display_name?: string | null;
+  site_email?: string | null;
   site_linked_at?: string | null;
 };
 

@@ -1540,6 +1540,8 @@ export default function ClienteDetailPage() {
   }
 
   const siteConta = [
+    customer.site_email || "",
+    customer.site_user_id ? `celular confirmado ${customer.phone || ""}` : "",
     customer.site_username
       ? `@${customer.site_username.replace(/^@/, "")}`
       : "",

@@ -6,6 +6,7 @@ alter table public.customers
   add column if not exists site_user_id text,
   add column if not exists site_username text,
   add column if not exists site_display_name text,
+  add column if not exists site_email text,
   add column if not exists site_linked_at timestamptz;
 
 create unique index if not exists customers_site_user_id_key

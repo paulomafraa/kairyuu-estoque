@@ -32,6 +32,7 @@ type ProfileBody = {
   siteUserId?: string;
   username?: string;
   displayName?: string;
+  email?: string;
   phone?: string;
 };
 
@@ -86,48 +87,68 @@ async function customersByPhone(
 }
 
 function missingSiteColumn(message: string): boolean {
-  return /site_user_id|site_username|site_display_name|site_linked_at/i.test(
+  return /site_user_id|site_username|site_display_name|site_email|site_linked_at/i.test(
     message,
   );
+}
+
+function clipEmail(value: unknown): string {
+  const text = String(value || "").trim().slice(0, 255);
+  return text.includes("@") ? text : "";
 }
 
 async function saveSiteProfile(
   admin: ReturnType<typeof createAdminClient>,
   customer: CustomerRow,
-  profile: { siteUserId: string; username: string; displayName: string },
+  profile: { siteUserId: string; username: string; displayName: string; email: string },
 ): Promise<{ saved: boolean; warning: string | null }> {
   const patch: Record<string, string | null> = {
     site_user_id: profile.siteUserId,
     site_username: profile.username || null,
     site_display_name: profile.displayName || null,
+    site_email: profile.email || null,
     site_linked_at: new Date().toISOString(),
   };
   if (profile.displayName && looksLikePhoneName(customer.name || "")) {
     patch.name = profile.displayName;
   }
 
-  const { error } = await admin.from("customers").update(patch).eq("id", customer.id);
+  let { error } = await admin.from("customers").update(patch).eq("id", customer.id);
+  if (error && /site_email/i.test(error.message)) {
+    delete patch.site_email;
+    ({ error } = await admin.from("customers").update(patch).eq("id", customer.id));
+  }
   if (error) {
     if (missingSiteColumn(error.message)) {
       return {
         saved: false,
         warning:
-          "Rode supabase/migration_site_account.sql para gravar o @ e o apelido.",
+          "Rode supabase/migration_site_account.sql para gravar o @, o e-mail e o apelido.",
       };
     }
     throw new Error(error.message);
   }
 
-  const { error: clearErr } = await admin
+  const clearPatch: Record<string, null> = {
+    site_user_id: null,
+    site_username: null,
+    site_display_name: null,
+    site_email: null,
+    site_linked_at: null,
+  };
+  let { error: clearErr } = await admin
     .from("customers")
-    .update({
-      site_user_id: null,
-      site_username: null,
-      site_display_name: null,
-      site_linked_at: null,
-    })
+    .update(clearPatch)
     .eq("site_user_id", profile.siteUserId)
     .neq("id", customer.id);
+  if (clearErr && /site_email/i.test(clearErr.message)) {
+    delete clearPatch.site_email;
+    ({ error: clearErr } = await admin
+      .from("customers")
+      .update(clearPatch)
+      .eq("site_user_id", profile.siteUserId)
+      .neq("id", customer.id));
+  }
   if (clearErr && !missingSiteColumn(clearErr.message)) {
     throw new Error(clearErr.message);
   }
@@ -281,6 +302,29 @@ async function rodadasDaConta(
     if (!ev || ev.kind !== "encomenda") continue;
     events.set(ev.id, { name: ev.name, opened_at: ev.opened_at || "" });
   }
+  return montarRodadas(admin, events, 12);
+}
+
+async function rodadasTodas(admin: ReturnType<typeof createAdminClient>) {
+  const { data, error } = await admin
+    .from("events")
+    .select("id, name, kind, opened_at")
+    .eq("kind", "encomenda")
+    .order("opened_at", { ascending: false })
+    .limit(80);
+  if (error) throw new Error(error.message);
+  const events = new Map<string, { name: string; opened_at: string }>();
+  for (const ev of data || []) {
+    events.set(ev.id, { name: ev.name || "Rodada de encomenda", opened_at: ev.opened_at || "" });
+  }
+  return montarRodadas(admin, events, 80);
+}
+
+async function montarRodadas(
+  admin: ReturnType<typeof createAdminClient>,
+  events: Map<string, { name: string; opened_at: string }>,
+  limit: number,
+) {
   const eventIds = [...events.keys()];
   if (!eventIds.length) return [];
 
@@ -311,7 +355,7 @@ async function rodadasDaConta(
       };
     })
     .sort((a, b) => b.openedAt.localeCompare(a.openedAt))
-    .slice(0, 12)
+    .slice(0, limit)
     .map(({ openedAt: _opened, ...round }) => round);
 }
 
@@ -320,7 +364,8 @@ function readProfile(body: ProfileBody) {
   const siteUserId = clip(body.siteUserId, 40);
   const username = clip(body.username, 32);
   const displayName = clip(body.displayName, 100);
-  return { phone, siteUserId, username, displayName };
+  const email = clipEmail(body.email);
+  return { phone, siteUserId, username, displayName, email };
 }
 
 export async function POST(req: Request) {
@@ -362,13 +407,16 @@ export async function GET(req: Request) {
     assertBotApiKey(req);
     const url = new URL(req.url);
     const phone = canonicalPhone(url.searchParams.get("phone") || "");
-    if (!phone) {
+    const todas = url.searchParams.get("all") === "1";
+    if (!phone && !todas) {
       return NextResponse.json({ error: "Informe o celular." }, { status: 400 });
     }
 
     const admin = createAdminClient();
     if (url.searchParams.get("view") === "viagem") {
-      const rounds = await rodadasDaConta(admin, phone);
+      const rounds = todas
+        ? await rodadasTodas(admin)
+        : await rodadasDaConta(admin, phone);
       return NextResponse.json({ rounds });
     }
 

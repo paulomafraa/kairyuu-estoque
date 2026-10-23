@@ -20,7 +20,20 @@ type LinkedCustomer = {
   name: string;
   phone: string;
   physical_box_id: string | null;
+  site_user_id?: string | null;
+  site_username?: string | null;
+  site_email?: string | null;
 };
+
+function siteAoLado(p: LinkedCustomer): string {
+  if (!p.site_user_id) return "";
+  const bits = [
+    p.site_email || "",
+    p.phone || "",
+    p.site_username ? `@${p.site_username.replace(/^@/, "")}` : "",
+  ].filter(Boolean);
+  return bits.join(" · ");
+}
 
 type Filter = "todas" | "com_cliente" | "sem_cliente";
 
@@ -118,7 +131,7 @@ export default function CaixinhasPage() {
     setError(null);
     const auth = await supabase.auth.getUser();
     setMeId(auth.data.user?.id ?? null);
-    const [bx, cu] = await Promise.all([
+    const [bx, cuFirst] = await Promise.all([
       supabase
         .from("physical_boxes")
         .select("*")
@@ -126,10 +139,19 @@ export default function CaixinhasPage() {
         .order("id", { ascending: true }),
       supabase
         .from("customers")
-        .select("id, name, phone, physical_box_id")
+        .select(
+          "id, name, phone, physical_box_id, site_user_id, site_username, site_email",
+        )
         .not("physical_box_id", "is", null)
         .order("name", { ascending: true }),
     ]);
+    const cu = cuFirst.error && /site_user_id|site_username|site_email/i.test(cuFirst.error.message)
+      ? await supabase
+          .from("customers")
+          .select("id, name, phone, physical_box_id")
+          .not("physical_box_id", "is", null)
+          .order("name", { ascending: true })
+      : cuFirst;
     if (bx.error) {
       setError(boxError(bx.error.message));
       setLoaded(true);
@@ -830,6 +852,9 @@ export default function CaixinhasPage() {
                       >
                         {p.name}
                       </Link>
+                      {siteAoLado(p) ? (
+                        <span className="text-xs text-zinc-500">{siteAoLado(p)}</span>
+                      ) : null}
                       <ConfirmButton
                         label="×"
                         confirmLabel="desvincular?"
